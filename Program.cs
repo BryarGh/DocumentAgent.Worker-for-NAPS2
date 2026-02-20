@@ -994,6 +994,7 @@ internal sealed class HttpUploadClient : IUploadClient
         _state.EnsureMachineUuid();
 
         var client = _factory.CreateClient();
+        client.Timeout = TimeSpan.FromMinutes(10); // allow large uploads/slower endpoints
         var attempts = 0;
         var backoff = TimeSpan.FromSeconds(1);
         var maxAttempts = 5;
