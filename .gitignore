@@ -1,0 +1,15 @@
+/bin/
+/obj/
+/.vs/
+/.idea/
+/.vscode/
+*.user
+*.suo
+*.userprefs
+*.sqlite
+/logs/
+/queue/
+/tmp/
+/scanned/
+/cache/
+/failed/
