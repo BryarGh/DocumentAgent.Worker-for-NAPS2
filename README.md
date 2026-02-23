@@ -4,7 +4,7 @@ A .NET 8 minimal API + background worker that drives NAPS2 CLI for reliable docu
 
 ## Features
 
-- Scan acquisition via NAPS2 `console` with 10-minute timeout and process-tree kill safety.
+- Scan acquisition via NAPS2 CLI with 10-minute timeout and process-tree kill safety (uses `console` subcommand on macOS/Linux; points directly to `naps2.console.exe` on Windows).
 - Scanner discovery across drivers (`apple`, `sane`, `escl`).
 - Disk-backed, crash-resilient job queue (queued → acquiring → processing → uploading → completed/failed).
 - Uploads with SHA256 verification, exponential backoff, bearer token.
@@ -24,9 +24,22 @@ Agent data directories are under `~/Documents/DocumentAgent` by default (config,
 
 `~/Documents/DocumentAgent/agent.config.json` example:
 
+**macOS:**
+
 ```json
 {
   "naps2_path": "/Applications/NAPS2.app/Contents/MacOS/NAPS2",
+  "upload_url": "https://your-app.test/api/document-agent/upload",
+  "agent_token": "YOUR_TOKEN",
+  "laravel_origin": "http://192.168.33.50"
+}
+```
+
+**Windows** (point directly to `naps2.console.exe` — no `console` subcommand needed):
+
+```json
+{
+  "naps2_path": "C:\\Program Files\\NAPS2\\naps2.console.exe",
   "upload_url": "https://your-app.test/api/document-agent/upload",
   "agent_token": "YOUR_TOKEN",
   "laravel_origin": "http://192.168.33.50"

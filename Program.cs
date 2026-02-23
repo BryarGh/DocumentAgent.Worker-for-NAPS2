@@ -448,7 +448,12 @@ internal sealed class ScanJobProcessor : BackgroundService
             CreateNoWindow = true,
             WorkingDirectory = Path.GetDirectoryName(outputPdf) ?? _paths.Scanned
         };
-        psi.ArgumentList.Add("console");
+        // On macOS/Linux NAPS2 uses a 'console' subcommand.
+        // On Windows the dedicated naps2.console.exe is used directly — no subcommand needed.
+        if (!OperatingSystem.IsWindows())
+        {
+            psi.ArgumentList.Add("console");
+        }
         psi.ArgumentList.Add("--profile");
         psi.ArgumentList.Add(job.Profile.ProfileName);
         psi.ArgumentList.Add("--output");
@@ -914,7 +919,12 @@ internal sealed class ScannerService
                     CreateNoWindow = true
                 };
 
-                psi.ArgumentList.Add("console");
+                // On macOS/Linux NAPS2 uses a 'console' subcommand.
+                // On Windows the dedicated naps2.console.exe is used directly — no subcommand needed.
+                if (!OperatingSystem.IsWindows())
+                {
+                    psi.ArgumentList.Add("console");
+                }
                 psi.ArgumentList.Add("--driver");
                 psi.ArgumentList.Add(driver);
                 psi.ArgumentList.Add("--listdevices");
