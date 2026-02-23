@@ -44,6 +44,11 @@ if (File.Exists(earlyConfigPath))
     try
     {
         var earlyJson = File.ReadAllText(earlyConfigPath);
+        // Auto-fix unescaped backslashes (common in Windows paths written by hand)
+        earlyJson = System.Text.RegularExpressions.Regex.Replace(
+            earlyJson,
+            @"(?<!\\)\\(?![""\\\/bfnrtu])",
+            @"\\");
         using var doc = JsonDocument.Parse(earlyJson);
         if (doc.RootElement.TryGetProperty("laravel_origin", out var prop))
             laravelOriginFromFile = prop.GetString();
@@ -579,7 +584,7 @@ internal sealed class AgentConfigProvider
             }
 
             var json = File.ReadAllText(_configPath);
-            Config = JsonSerializer.Deserialize<AgentConfig>(json, new JsonSerializerOptions(JsonSerializerDefaults.Web)) ?? new AgentConfig();
+            Config = TryDeserialize(json) ?? new AgentConfig();
             return Config;
         }
         catch (Exception ex)
@@ -587,6 +592,47 @@ internal sealed class AgentConfigProvider
             _logger.LogError(ex, "Failed to load agent.config.json");
             Config = new AgentConfig();
             return Config;
+        }
+    }
+
+    /// <summary>
+    /// Tries to deserialise the JSON. If it fails (common on Windows when the user wrote
+    /// single backslashes in paths, e.g. "C:\Program Files\..."), automatically escapes
+    /// backslashes and retries once before giving up.
+    /// </summary>
+    private AgentConfig? TryDeserialize(string json)
+    {
+        var opts = new JsonSerializerOptions(JsonSerializerDefaults.Web);
+        try
+        {
+            return JsonSerializer.Deserialize<AgentConfig>(json, opts);
+        }
+        catch (JsonException firstEx)
+        {
+            // Replace unescaped backslashes inside JSON string values.
+            // Only replace \ that are NOT already part of a valid escape sequence.
+            var fixed_json = System.Text.RegularExpressions.Regex.Replace(
+                json,
+                @"(?<!\\)\\(?![""\\\/bfnrtu])",
+                @"\\");
+
+            if (fixed_json == json)
+            {
+                // Nothing changed — re-throw the original error.
+                throw;
+            }
+
+            try
+            {
+                var result = JsonSerializer.Deserialize<AgentConfig>(fixed_json, opts);
+                _logger.LogWarning("agent.config.json contained unescaped backslashes (Windows paths) — loaded successfully after auto-correction. Consider using forward slashes or double backslashes in the config.");
+                return result;
+            }
+            catch (JsonException)
+            {
+                // Throw the original, more meaningful exception.
+                throw firstEx;
+            }
         }
     }
 }
@@ -908,7 +954,12 @@ internal sealed class ScannerService
 
         try
         {
-            var drivers = new[] { "apple", "sane", "escl" };
+            // Windows uses TWAIN/WIA drivers; macOS uses Apple/SANE/ESCL; Linux uses SANE/ESCL.
+            var drivers = OperatingSystem.IsWindows()
+                ? new[] { "twain", "wia", "escl" }
+                : OperatingSystem.IsMacOS()
+                    ? new[] { "apple", "escl", "sane" }
+                    : new[] { "sane", "escl" };
             var found = false;
             foreach (var driver in drivers)
             {
