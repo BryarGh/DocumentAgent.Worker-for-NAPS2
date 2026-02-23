@@ -805,13 +805,15 @@ internal sealed class ScannerService
     private readonly List<ScannerInfo> _scanners = new();
     private readonly object _sync = new();
     private readonly AgentConfigProvider _config;
+    private readonly ScanProfileStore _profileStore;
     private readonly ILogger<ScannerService> _logger;
     private DateTime _lastRefresh = DateTime.MinValue;
     private readonly TimeSpan _refreshInterval = TimeSpan.FromSeconds(30);
 
-    public ScannerService(AgentConfigProvider config, ILogger<ScannerService> logger)
+    public ScannerService(AgentConfigProvider config, ScanProfileStore profileStore, ILogger<ScannerService> logger)
     {
         _config = config;
+        _profileStore = profileStore;
         _logger = logger;
     }
 
@@ -967,6 +969,29 @@ internal sealed class ScannerService
                 }
 
                 found = true;
+
+                // Auto-create a default profile for any newly discovered scanner
+                // that doesn't already have one, so users don't need to POST /profiles manually.
+                foreach (var scanner in lines)
+                {
+                    var profileName = scanner; // use scanner name as default profile name
+                    if (_profileStore.Get(profileName) is null)
+                    {
+                        _profileStore.Save(new ScanProfile
+                        {
+                            ProfileName = profileName,
+                            ScannerName = scanner,
+                            Driver = driver,
+                            Dpi = 300,
+                            ColorMode = "color",
+                            Source = "ADF",
+                            Duplex = false,
+                            PaperSize = "A4"
+                        });
+                        _logger.LogInformation("Auto-created default profile for scanner {Scanner}", scanner);
+                    }
+                }
+
                 break;
             }
 
