@@ -6,4 +6,8 @@
     <RootNamespace>DocumentAgent.Worker</RootNamespace>
     <AssemblyName>DocumentAgent.Worker</AssemblyName>
   </PropertyGroup>
+  <ItemGroup>
+    <!-- Enables running as a Windows Service (no-op on macOS/Linux) -->
+    <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="8.0.0" />
+  </ItemGroup>
 </Project>

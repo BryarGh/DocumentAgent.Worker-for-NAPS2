@@ -14,6 +14,13 @@ using Microsoft.Extensions.Options;
 
 var builder = WebApplication.CreateBuilder(args);
 
+// Allows the app to run as a Windows Service (sc create / sc start).
+// On macOS/Linux this is a no-op.
+builder.Host.UseWindowsService(options =>
+{
+    options.ServiceName = "DocumentAgent";
+});
+
 builder.Logging.ClearProviders();
 var appState = new AppState();
 builder.Logging.AddProvider(new FileJsonLoggerProvider(appState));
@@ -82,6 +89,7 @@ builder.Services.AddSingleton<ScanProfileStore>();
 builder.Services.AddSingleton<ScannerService>();
 builder.Services.AddSingleton<IUploadClient, HttpUploadClient>();
 builder.Services.AddHostedService<ScanJobProcessor>();
+builder.Services.AddHostedService<CleanupService>();
 
 var app = builder.Build();
 
@@ -1340,6 +1348,138 @@ internal sealed class FileJsonLogger : ILogger
             var path = Path.Combine(basePath, DateTime.UtcNow.ToString("yyyy-MM-dd") + ".log");
             File.AppendAllText(path, line + Environment.NewLine);
         }
+    }
+}
+
+/// <summary>
+/// Runs hourly and removes temporary / old files that are no longer needed:
+/// - tmp/ folder: always cleared
+/// - scanned/ PDFs: removed after 7 days (uploaded files) or kept for failed jobs (up to 30 days)
+/// - queue/jobs/ JSON: completed/failed entries older than 7 days
+/// </summary>
+internal sealed class CleanupService : BackgroundService
+{
+    private readonly AppPaths _paths;
+    private readonly ILogger<CleanupService> _logger;
+    private static readonly TimeSpan Interval = TimeSpan.FromHours(1);
+    private static readonly TimeSpan KeepCompleted = TimeSpan.FromDays(7);
+    private static readonly TimeSpan KeepFailed = TimeSpan.FromDays(30);
+
+    public CleanupService(AppPaths paths, ILogger<CleanupService> logger)
+    {
+        _paths = paths;
+        _logger = logger;
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        // Run once shortly after startup, then every hour.
+        await Task.Delay(TimeSpan.FromMinutes(2), stoppingToken);
+
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            try { RunCleanup(); }
+            catch (Exception ex) { _logger.LogError(ex, "Cleanup error"); }
+
+            await Task.Delay(Interval, stoppingToken);
+        }
+    }
+
+    private void RunCleanup()
+    {
+        var deleted = 0;
+
+        // 1. Wipe tmp/ entirely
+        deleted += WipeDirectory(_paths.Tmp);
+
+        // 2. Remove old scanned job folders
+        var scannedDir = new DirectoryInfo(_paths.Scanned);
+        if (scannedDir.Exists)
+        {
+            foreach (var jobDir in scannedDir.GetDirectories())
+            {
+                var age = DateTime.UtcNow - jobDir.CreationTimeUtc;
+                if (age > KeepCompleted)
+                {
+                    try { jobDir.Delete(recursive: true); deleted++; }
+                    catch (Exception ex) { _logger.LogWarning(ex, "Could not delete scanned folder {Dir}", jobDir.FullName); }
+                }
+            }
+        }
+
+        // 3. Remove old completed/failed queue job JSON files
+        var jobsDir = Path.Combine(_paths.Queue, "jobs");
+        if (Directory.Exists(jobsDir))
+        {
+            foreach (var file in Directory.GetFiles(jobsDir, "*.json"))
+            {
+                try
+                {
+                    var json = File.ReadAllText(file);
+                    using var doc = JsonDocument.Parse(json);
+                    var root = doc.RootElement;
+
+                    var statusStr = root.TryGetProperty("Status", out var s) ? s.GetString() : null;
+                    var isTerminal = statusStr is "Completed" or "Failed";
+                    if (!isTerminal) continue;
+
+                    var age = DateTime.UtcNow - File.GetLastWriteTimeUtc(file);
+                    var threshold = statusStr == "Failed" ? KeepFailed : KeepCompleted;
+                    if (age > threshold)
+                    {
+                        File.Delete(file);
+                        deleted++;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Could not process job file {File} during cleanup", file);
+                }
+            }
+        }
+
+        // 4. Remove old cache/completed files (PDFs already uploaded)
+        deleted += WipeOldFiles(Path.Combine(_paths.Cache, "completed"), KeepCompleted);
+
+        // 5. Remove old failed/ files
+        deleted += WipeOldFiles(_paths.Failed, KeepFailed);
+
+        if (deleted > 0)
+            _logger.LogInformation("Cleanup removed {Count} file(s)/folder(s)", deleted);
+    }
+
+    private static int WipeDirectory(string path)
+    {
+        if (!Directory.Exists(path)) return 0;
+        var count = 0;
+        foreach (var file in Directory.GetFiles(path, "*", SearchOption.AllDirectories))
+        {
+            try { File.Delete(file); count++; } catch { /* ignore */ }
+        }
+        foreach (var dir in Directory.GetDirectories(path))
+        {
+            try { Directory.Delete(dir, recursive: true); count++; } catch { /* ignore */ }
+        }
+        return count;
+    }
+
+    private static int WipeOldFiles(string path, TimeSpan maxAge)
+    {
+        if (!Directory.Exists(path)) return 0;
+        var count = 0;
+        foreach (var file in Directory.GetFiles(path, "*", SearchOption.AllDirectories))
+        {
+            try
+            {
+                if (DateTime.UtcNow - File.GetLastWriteTimeUtc(file) > maxAge)
+                {
+                    File.Delete(file);
+                    count++;
+                }
+            }
+            catch { /* ignore */ }
+        }
+        return count;
     }
 }
 
