@@ -95,3 +95,104 @@ curl -X POST http://127.0.0.1:3333/scan \
 
 curl http://127.0.0.1:3333/scan/<job_id>
 ```
+
+## Windows quickstart & troubleshooting
+
+Follow these steps on Windows machines to install and run the agent reliably, and use the troubleshooting tips when something fails.
+
+- Publish for distribution (developer machine):
+
+```powershell
+# run as Administrator from the project folder
+.\install-service.ps1 -Publish
+```
+
+- End-user install (no SDK required): copy `DocumentAgent.Worker.exe` and `install-service.ps1` into the same folder on the laptop, open an elevated PowerShell, then run:
+
+```powershell
+# run as Administrator
+.\install-service.ps1
+```
+
+- If PowerShell blocks the script, use one of these (Administrator):
+
+```powershell
+# Temporary bypass
+powershell -NoProfile -ExecutionPolicy Bypass -File "C:\path\to\install-service.ps1"
+
+# Or unblock then run
+Unblock-File -Path "C:\path\to\install-service.ps1"
+powershell -NoProfile -ExecutionPolicy Bypass -File "C:\path\to\install-service.ps1"
+```
+
+- Common mistakes & fixes
+
+- Double PowerShell invocation error
+  - Error: `no : The term 'no' is not recognized ...` happens when you run `powershell powershell -NoProfile ...` inside an already opened PowerShell session. Either run the command from CMD or simply run the script directly from an elevated PowerShell prompt:
+
+```powershell
+# WRONG (causes parsing errors inside PowerShell):
+powershell powershell -NoProfile -ExecutionPolicy Bypass -File .\install-service.ps1
+
+# CORRECT from elevated PowerShell:
+.\install-service.ps1
+
+# OR from elevated CMD:
+powershell -NoProfile -ExecutionPolicy Bypass -File "C:\path\to\install-service.ps1"
+```
+
+- Service create/delete race (error 1072)
+  - If you see `CreateService FAILED 1072: The specified service has been marked for deletion.`, Windows is still removing the old service. Wait a few seconds (or reboot) and retry the `sc create` command. Example manual install:
+
+```powershell
+sc create DocumentAgent binPath= "C:\Path\To\DocumentAgent.Worker.exe" start= auto DisplayName= "Document Agent"
+sc description DocumentAgent "Loopback scanning agent that drives NAPS2 and uploads scanned PDFs to your Laravel server."
+sc start DocumentAgent
+```
+
+- Verify service status and logs
+
+```powershell
+sc query DocumentAgent
+Get-Service DocumentAgent
+dir "$env:USERPROFILE\Documents\DocumentAgent\logs" | sort LastWriteTime -Descending | select -First 5
+curl http://127.0.0.1:3333/scanners
+```
+
+- agent.config.json notes
+  - Path examples for Windows must escape backslashes or use forward slashes. Example valid JSON value:
+
+```json
+{
+  "naps2_path": "C:\\Program Files\\NAPS2\\NAPS2.Console.exe",
+  "upload_url": "https://your-app.test/api/document-agent/upload",
+  "agent_token": "YOUR_TOKEN",
+  "laravel_origin": "http://192.168.33.50"
+}
+```
+
+- The agent auto-corrects common issues: unescaped backslashes and invisible Unicode characters inserted by copy/paste (U+202A etc). If the agent logs `Skipping scanner refresh — NAPS2 not found at path: ...`, check `agent.config.json` for hidden characters or extra whitespace.
+
+- NAPS2 & drivers on Windows
+  - Windows commonly uses `twain` and `wia` drivers. If `/scanners` returns empty, check that `naps2_path` points to the correct `NAPS2.Console.exe` and run that binary manually to confirm it lists devices:
+
+```powershell
+& "C:\Program Files\NAPS2\NAPS2.Console.exe" --listdevices --driver twain
+```
+
+- If `--listdevices` outputs scanner names but the agent still shows none, copy the exact `stdout` and `stderr` lines from the agent log and paste them into an issue — the logs now include full NAPS2 output to help debug.
+
+- Antivirus / permissions
+  - Windows Defender / AV software may block the published exe. If the agent fails to start or NAPS2 cannot access drivers, temporarily disable AV or add the agent folder to exclusions.
+
+- Uninstall
+  - To remove the service:
+
+```powershell
+.\install-service.ps1 -Uninstall
+# or (manual)
+sc stop DocumentAgent
+sc delete DocumentAgent
+```
+
+If you want additional quickchecks to include in the README (e.g. Event Viewer queries, exact log examples), tell me which ones you prefer and I will add them.
