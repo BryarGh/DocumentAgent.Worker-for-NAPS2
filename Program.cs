@@ -945,6 +945,7 @@ internal sealed class ScannerService
 
         if (!_config.Naps2ExecutableExists)
         {
+            _logger.LogWarning("Skipping scanner refresh — NAPS2 not found at path: {Path}", _config.Config.Naps2Path ?? "(not configured)");
             lock (_sync)
             {
                 _scanners.Clear();
@@ -987,6 +988,12 @@ internal sealed class ScannerService
                 var stdout = proc.StandardOutput.ReadToEnd();
                 var stderr = proc.StandardError.ReadToEnd();
                 proc.WaitForExit();
+
+                _logger.LogInformation(
+                    "NAPS2 listdevices driver={Driver} exit={Exit} stdout={Stdout} stderr={Stderr}",
+                    driver, proc.ExitCode,
+                    string.IsNullOrWhiteSpace(stdout) ? "(empty)" : stdout.Trim(),
+                    string.IsNullOrWhiteSpace(stderr) ? "(empty)" : stderr.Trim());
 
                 if (proc.ExitCode != 0)
                 {
