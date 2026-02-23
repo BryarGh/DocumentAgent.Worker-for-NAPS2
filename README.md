@@ -29,9 +29,21 @@ Agent data directories are under `~/Documents/DocumentAgent` by default (config,
   "naps2_path": "/Applications/NAPS2.app/Contents/MacOS/NAPS2",
   "upload_url": "https://your-app.test/api/document-agent/upload",
   "agent_token": "YOUR_TOKEN",
-  "laravel_origin": "http://localhost:8000"
+  "laravel_origin": "http://192.168.33.50"
 }
 ```
+
+## CORS / Allowed Origin
+
+The agent reads `laravel_origin` from `agent.config.json` and uses it as the allowed CORS origin automatically — no extra environment variables needed. Set it to the address your users open in their browser (your Laravel server).
+
+Fallback order:
+
+1. `laravel_origin` in `agent.config.json` ← recommended
+2. `AGENT_ALLOWED_ORIGIN` environment variable
+3. `*` (allow all — development only)
+
+The agent sends `Access-Control-Allow-Origin` headers on every response and handles `OPTIONS` preflight requests automatically.
 
 ## API Endpoints (loopback only)
 

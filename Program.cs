@@ -31,9 +31,31 @@ builder.Services.Configure<AppPathsOptions>(options =>
     options.BasePath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "DocumentAgent");
 });
 
+// Read laravel_origin from agent.config.json early (before DI builds) so CORS is
+// configured from the same file each laptop already has, with fallback to the
+// AGENT_ALLOWED_ORIGIN env var, then wildcard for development.
+var earlyConfigPath = Path.Combine(
+    Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+    "DocumentAgent", "agent.config.json");
+
+string? laravelOriginFromFile = null;
+if (File.Exists(earlyConfigPath))
+{
+    try
+    {
+        var earlyJson = File.ReadAllText(earlyConfigPath);
+        using var doc = JsonDocument.Parse(earlyJson);
+        if (doc.RootElement.TryGetProperty("laravel_origin", out var prop))
+            laravelOriginFromFile = prop.GetString();
+    }
+    catch { /* ignore — AgentConfigProvider will log it properly later */ }
+}
+
 builder.Services.Configure<SecurityOptions>(options =>
 {
-    options.AllowedOrigin = builder.Configuration["AGENT_ALLOWED_ORIGIN"] ?? "*";
+    options.AllowedOrigin = laravelOriginFromFile
+        ?? builder.Configuration["AGENT_ALLOWED_ORIGIN"]
+        ?? "*";
 });
 
 builder.Services.AddHttpClient();
@@ -1218,9 +1240,28 @@ internal sealed class LoopbackAndOriginMiddleware
         }
 
         var origin = context.Request.Headers["Origin"].ToString();
+
+        // Validate origin when not wildcard
         if (!string.IsNullOrWhiteSpace(origin) && _options.AllowedOrigin != "*" && !string.Equals(origin, _options.AllowedOrigin, StringComparison.OrdinalIgnoreCase))
         {
             context.Response.StatusCode = StatusCodes.Status403Forbidden;
+            return;
+        }
+
+        // Add CORS headers so the browser accepts the response
+        var allowOrigin = _options.AllowedOrigin == "*"
+            ? (string.IsNullOrWhiteSpace(origin) ? "*" : origin)
+            : _options.AllowedOrigin;
+
+        context.Response.Headers["Access-Control-Allow-Origin"] = allowOrigin;
+        context.Response.Headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS";
+        context.Response.Headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With";
+        context.Response.Headers["Access-Control-Max-Age"] = "3600";
+
+        // Handle CORS preflight
+        if (context.Request.Method.Equals("OPTIONS", StringComparison.OrdinalIgnoreCase))
+        {
+            context.Response.StatusCode = StatusCodes.Status204NoContent;
             return;
         }
 
