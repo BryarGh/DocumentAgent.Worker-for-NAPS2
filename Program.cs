@@ -51,7 +51,16 @@ if (File.Exists(earlyConfigPath))
             @"\\");
         using var doc = JsonDocument.Parse(earlyJson);
         if (doc.RootElement.TryGetProperty("laravel_origin", out var prop))
+        {
             laravelOriginFromFile = prop.GetString();
+            // Strip invisible Unicode chars that get embedded when copy-pasting URLs
+            if (laravelOriginFromFile is not null)
+                laravelOriginFromFile = new string(laravelOriginFromFile.Where(c =>
+                    c != '\u200B' && c != '\u200C' && c != '\u200D' &&
+                    c != '\u200E' && c != '\u200F' && c != '\u202A' &&
+                    c != '\u202B' && c != '\u202C' && c != '\u202D' &&
+                    c != '\u202E' && c != '\uFEFF').ToArray()).Trim();
+        }
     }
     catch { /* ignore — AgentConfigProvider will log it properly later */ }
 }
@@ -585,6 +594,14 @@ internal sealed class AgentConfigProvider
 
             var json = File.ReadAllText(_configPath);
             Config = TryDeserialize(json) ?? new AgentConfig();
+
+            // Strip invisible Unicode directional/formatting characters from paths.
+            // These are silently inserted when copying paths from browsers, Word, or PDFs.
+            if (Config.Naps2Path is not null)
+                Config.Naps2Path = StripInvisibleChars(Config.Naps2Path);
+            if (Config.UploadUrl is not null)
+                Config.UploadUrl = StripInvisibleChars(Config.UploadUrl);
+
             return Config;
         }
         catch (Exception ex)
@@ -594,6 +611,25 @@ internal sealed class AgentConfigProvider
             return Config;
         }
     }
+
+    /// <summary>
+    /// Removes invisible Unicode formatting/directional characters (e.g. U+202A, U+200B, U+FEFF)
+    /// that get silently embedded when paths are copy-pasted from browsers, PDFs, or Office apps.
+    /// </summary>
+    private static string StripInvisibleChars(string value) =>
+        new string(value.Where(c =>
+            c != '\u200B' && // zero-width space
+            c != '\u200C' && // zero-width non-joiner
+            c != '\u200D' && // zero-width joiner
+            c != '\u200E' && // left-to-right mark
+            c != '\u200F' && // right-to-left mark
+            c != '\u202A' && // left-to-right embedding
+            c != '\u202B' && // right-to-left embedding
+            c != '\u202C' && // pop directional formatting
+            c != '\u202D' && // left-to-right override
+            c != '\u202E' && // right-to-left override
+            c != '\uFEFF'    // byte order mark / zero-width no-break space
+        ).ToArray()).Trim();
 
     /// <summary>
     /// Tries to deserialise the JSON. If it fails (common on Windows when the user wrote
