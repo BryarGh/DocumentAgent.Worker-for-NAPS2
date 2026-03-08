@@ -188,6 +188,12 @@ app.MapPost("/scan", (ScanRequest request, ScanJobQueue queue, AppState state, S
 {
     var logger = loggerFactory.CreateLogger("Scan");
 
+    logger.LogInformation(
+        "Scan request received document_id={DocumentId} profile_name={ProfileName} client_request_id={ClientRequestId}",
+        request.DocumentId ?? "(null)",
+        request.ProfileName ?? "(null)",
+        request.ClientRequestId ?? "(null)");
+
     if (string.IsNullOrWhiteSpace(request.DocumentId) || string.IsNullOrWhiteSpace(request.ProfileName))
     {
         return Results.Json(new { error = "missing_required_fields" }, statusCode: StatusCodes.Status400BadRequest);
@@ -201,12 +207,22 @@ app.MapPost("/scan", (ScanRequest request, ScanJobQueue queue, AppState state, S
     var profile = profiles.Get(request.ProfileName);
     if (profile is null)
     {
+        var knownProfiles = profiles.GetAll().Select(p => p.ProfileName).ToArray();
+        logger.LogWarning(
+            "Scan refused: profile not found profile_name={ProfileName} known_profiles={KnownProfiles}",
+            request.ProfileName,
+            knownProfiles.Length == 0 ? "(none)" : string.Join(" | ", knownProfiles));
         return Results.Json(new { error = "profile_not_found" }, statusCode: StatusCodes.Status400BadRequest);
     }
 
     if (!scannerService.IsDeviceAvailable(profile.ScannerName))
     {
-        logger.LogWarning("Scan refused: device missing {Device}", profile.ScannerName);
+        var availableScanners = scannerService.GetScanners().Select(s => $"{s.Name} [{s.Driver}]").ToArray();
+        logger.LogWarning(
+            "Scan refused: device missing configured_device={Device} configured_driver={Driver} available_scanners={AvailableScanners}",
+            profile.ScannerName,
+            profile.Driver ?? "(not set)",
+            availableScanners.Length == 0 ? "(none)" : string.Join(" | ", availableScanners));
         return Results.Json(new { error = "scanner_unavailable" }, statusCode: StatusCodes.Status400BadRequest);
     }
 
@@ -216,7 +232,15 @@ app.MapPost("/scan", (ScanRequest request, ScanJobQueue queue, AppState state, S
     }
 
     var job = queue.Enqueue(profile, request.DocumentId!, request.ClientRequestId);
-    logger.LogInformation("Scan job queued {JobId}", job.JobId);
+    logger.LogInformation(
+        "Scan job queued job_id={JobId} profile_name={ProfileName} scanner_name={ScannerName} driver={Driver} dpi={Dpi} source={Source} duplex={Duplex}",
+        job.JobId,
+        profile.ProfileName,
+        profile.ScannerName,
+        profile.Driver ?? "(not set)",
+        profile.Dpi,
+        profile.Source,
+        profile.Duplex);
     return Results.Accepted($"/scan/{job.JobId}", new { job_id = job.JobId, status = job.Status.ToString().ToLowerInvariant() });
 });
 
@@ -458,6 +482,9 @@ internal sealed class ScanJobProcessor : BackgroundService
     {
         if (!_config.Naps2ExecutableExists)
         {
+            _logger.LogError(
+                "NAPS2 not configured or missing path={Path}",
+                _config.Config.Naps2Path ?? "(not configured)");
             throw new InvalidOperationException("naps2_not_configured");
         }
 
@@ -481,12 +508,35 @@ internal sealed class ScanJobProcessor : BackgroundService
         psi.ArgumentList.Add("--output");
         psi.ArgumentList.Add(outputPdf);
 
+        _logger.LogInformation(
+            "Launching NAPS2 scan job_id={JobId} naps2_path={Naps2Path} working_dir={WorkingDir} args={Args} profile_name={ProfileName} scanner_name={ScannerName} configured_driver={Driver} output={OutputPdf}",
+            job.JobId,
+            psi.FileName,
+            psi.WorkingDirectory,
+            DiagnosticLogHelper.FormatArguments(psi.ArgumentList),
+            job.Profile.ProfileName,
+            job.Profile.ScannerName,
+            job.Profile.Driver ?? "(not set)",
+            outputPdf);
+
         using var proc = new Process { StartInfo = psi, EnableRaisingEvents = true };
         var sw = Stopwatch.StartNew();
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
         cts.CancelAfter(_acquireTimeout);
 
-        proc.Start();
+        try
+        {
+            proc.Start();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex,
+                "Failed to start NAPS2 process job_id={JobId} naps2_path={Naps2Path} args={Args}",
+                job.JobId,
+                psi.FileName,
+                DiagnosticLogHelper.FormatArguments(psi.ArgumentList));
+            throw;
+        }
 
         var stdoutTask = proc.StandardOutput.ReadToEndAsync();
         var stderrTask = proc.StandardError.ReadToEndAsync();
@@ -513,16 +563,77 @@ internal sealed class ScanJobProcessor : BackgroundService
         var stderr = await stderrTask;
         var exitCode = proc.ExitCode;
 
-        _logger.LogInformation("NAPS2 finished {JobId} exit {Exit} duration_ms {Duration}", job.JobId, exitCode, sw.ElapsedMilliseconds);
+        var outputExists = File.Exists(outputPdf);
+        var outputBytes = outputExists ? new FileInfo(outputPdf).Length : 0L;
 
-        if (exitCode != 0 || !File.Exists(outputPdf) || new FileInfo(outputPdf).Length == 0)
+        _logger.LogInformation(
+            "NAPS2 finished job_id={JobId} exit={Exit} duration_ms={Duration} output_exists={OutputExists} output_bytes={OutputBytes} stdout={Stdout} stderr={Stderr}",
+            job.JobId,
+            exitCode,
+            sw.ElapsedMilliseconds,
+            outputExists,
+            outputBytes,
+            DiagnosticLogHelper.TruncateForLog(stdout),
+            DiagnosticLogHelper.TruncateForLog(stderr));
+
+        if (exitCode != 0 || !outputExists || outputBytes == 0)
         {
             job.ErrorCode = "scan_failed";
-            _logger.LogError("NAPS2 scan failed {JobId} exit {Exit} stderr {Stderr}", job.JobId, exitCode, stderr);
+            _logger.LogError(
+                "NAPS2 scan failed job_id={JobId} exit={Exit} output_exists={OutputExists} output_bytes={OutputBytes} profile_name={ProfileName} scanner_name={ScannerName} configured_driver={Driver} args={Args} stdout={Stdout} stderr={Stderr}",
+                job.JobId,
+                exitCode,
+                outputExists,
+                outputBytes,
+                job.Profile.ProfileName,
+                job.Profile.ScannerName,
+                job.Profile.Driver ?? "(not set)",
+                DiagnosticLogHelper.FormatArguments(psi.ArgumentList),
+                DiagnosticLogHelper.TruncateForLog(stdout),
+                DiagnosticLogHelper.TruncateForLog(stderr));
             throw new InvalidOperationException("scan_failed");
         }
 
         job.LocalFilePaths = new List<string> { outputPdf };
+    }
+}
+
+internal static class DiagnosticLogHelper
+{
+    public static string FormatArguments(IEnumerable<string> args)
+    {
+        return string.Join(" ", args.Select(QuoteArgument));
+    }
+
+    public static string TruncateForLog(string? value, int max = 2000)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return "(empty)";
+        }
+
+        var cleaned = value.Trim();
+        if (cleaned.Length <= max)
+        {
+            return cleaned;
+        }
+
+        return cleaned[..max] + "... (truncated)";
+    }
+
+    private static string QuoteArgument(string value)
+    {
+        if (string.IsNullOrEmpty(value))
+        {
+            return "\"\"";
+        }
+
+        if (value.Any(char.IsWhiteSpace) || value.Contains('"'))
+        {
+            return "\"" + value.Replace("\"", "\\\"") + "\"";
+        }
+
+        return value;
     }
 }
 
