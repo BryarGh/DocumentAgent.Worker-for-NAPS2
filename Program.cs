@@ -162,10 +162,19 @@ app.MapPost("/profiles", (ProfileRequest request, ScanProfileStore store, Scanne
         }
     }
 
+    var configuredDriver = request.Driver;
+    if (string.IsNullOrWhiteSpace(configuredDriver))
+    {
+        configuredDriver = scannerService.GetScanners()
+            .FirstOrDefault(s => string.Equals(s.Name, scannerName, StringComparison.OrdinalIgnoreCase))
+            ?.Driver;
+    }
+
     var profile = new ScanProfile
     {
         ProfileName = profileName,
         ScannerName = scannerName,
+        Driver = configuredDriver,
         Dpi = request.Dpi ?? 300,
         ColorMode = request.ColorMode ?? "color",
         Source = request.Source ?? "ADF",
@@ -283,6 +292,9 @@ internal sealed class ProfileRequest
 
     [JsonPropertyName("scanner_name")]
     public string? ScannerName { get; init; }
+
+    [JsonPropertyName("driver")]
+    public string? Driver { get; init; }
 
     [JsonPropertyName("dpi")]
     public int? Dpi { get; init; }
@@ -488,6 +500,80 @@ internal sealed class ScanJobProcessor : BackgroundService
             throw new InvalidOperationException("naps2_not_configured");
         }
 
+        var profileAttempt = BuildScanByProfileStartInfo(job, outputPdf);
+        var profileResult = await RunNaps2ScanAsync(job, profileAttempt, stoppingToken, "profile");
+        if (profileResult.IsSuccess)
+        {
+            job.LocalFilePaths = new List<string> { outputPdf };
+            return;
+        }
+
+        var shouldFallbackToDevice = OperatingSystem.IsWindows()
+            && !string.IsNullOrWhiteSpace(job.Profile.ScannerName)
+            && (profileResult.Stdout.Contains("unavailable or ambiguous", StringComparison.OrdinalIgnoreCase)
+                || profileResult.Stderr.Contains("unavailable or ambiguous", StringComparison.OrdinalIgnoreCase));
+
+        if (shouldFallbackToDevice)
+        {
+            _logger.LogWarning(
+                "Profile-based scan failed with unavailable/ambiguous profile. Retrying by scanner device name job_id={JobId} scanner_name={ScannerName}",
+                job.JobId,
+                job.Profile.ScannerName);
+
+            var attemptedDrivers = new List<string>();
+            foreach (var driver in DiagnosticLogHelper.GetWindowsDriverCandidates(job.Profile.Driver))
+            {
+                attemptedDrivers.Add(driver);
+                var deviceAttempt = BuildScanByDeviceStartInfo(job, outputPdf, driver);
+                var deviceResult = await RunNaps2ScanAsync(job, deviceAttempt, stoppingToken, $"device/{driver}");
+                if (deviceResult.IsSuccess)
+                {
+                    job.Profile.Driver = driver;
+                    job.LocalFilePaths = new List<string> { outputPdf };
+                    _logger.LogInformation(
+                        "Device fallback scan succeeded job_id={JobId} scanner_name={ScannerName} driver={Driver}",
+                        job.JobId,
+                        job.Profile.ScannerName,
+                        driver);
+                    return;
+                }
+            }
+
+            _logger.LogError(
+                "All device fallback attempts failed job_id={JobId} scanner_name={ScannerName} attempted_drivers={Drivers}",
+                job.JobId,
+                job.Profile.ScannerName,
+                string.Join(",", attemptedDrivers));
+        }
+
+        job.ErrorCode = "scan_failed";
+        throw new InvalidOperationException("scan_failed");
+    }
+
+    private ProcessStartInfo BuildScanByProfileStartInfo(ScanJob job, string outputPdf)
+    {
+        var psi = CreateBaseNaps2StartInfo(outputPdf);
+        psi.ArgumentList.Add("--profile");
+        psi.ArgumentList.Add(job.Profile.ProfileName);
+        psi.ArgumentList.Add("--output");
+        psi.ArgumentList.Add(outputPdf);
+        return psi;
+    }
+
+    private ProcessStartInfo BuildScanByDeviceStartInfo(ScanJob job, string outputPdf, string driver)
+    {
+        var psi = CreateBaseNaps2StartInfo(outputPdf);
+        psi.ArgumentList.Add("--driver");
+        psi.ArgumentList.Add(driver);
+        psi.ArgumentList.Add("--device");
+        psi.ArgumentList.Add(job.Profile.ScannerName);
+        psi.ArgumentList.Add("--output");
+        psi.ArgumentList.Add(outputPdf);
+        return psi;
+    }
+
+    private ProcessStartInfo CreateBaseNaps2StartInfo(string outputPdf)
+    {
         var psi = new ProcessStartInfo
         {
             FileName = _config.Config.Naps2Path!,
@@ -497,27 +583,29 @@ internal sealed class ScanJobProcessor : BackgroundService
             CreateNoWindow = true,
             WorkingDirectory = Path.GetDirectoryName(outputPdf) ?? _paths.Scanned
         };
+
         // On macOS/Linux NAPS2 uses a 'console' subcommand.
         // On Windows the dedicated naps2.console.exe is used directly — no subcommand needed.
         if (!OperatingSystem.IsWindows())
         {
             psi.ArgumentList.Add("console");
         }
-        psi.ArgumentList.Add("--profile");
-        psi.ArgumentList.Add(job.Profile.ProfileName);
-        psi.ArgumentList.Add("--output");
-        psi.ArgumentList.Add(outputPdf);
 
+        return psi;
+    }
+
+    private async Task<ScanAttemptResult> RunNaps2ScanAsync(ScanJob job, ProcessStartInfo psi, CancellationToken stoppingToken, string attemptKind)
+    {
         _logger.LogInformation(
-            "Launching NAPS2 scan job_id={JobId} naps2_path={Naps2Path} working_dir={WorkingDir} args={Args} profile_name={ProfileName} scanner_name={ScannerName} configured_driver={Driver} output={OutputPdf}",
+            "Launching NAPS2 scan job_id={JobId} attempt_kind={AttemptKind} naps2_path={Naps2Path} working_dir={WorkingDir} args={Args} profile_name={ProfileName} scanner_name={ScannerName} configured_driver={Driver}",
             job.JobId,
+            attemptKind,
             psi.FileName,
             psi.WorkingDirectory,
             DiagnosticLogHelper.FormatArguments(psi.ArgumentList),
             job.Profile.ProfileName,
             job.Profile.ScannerName,
-            job.Profile.Driver ?? "(not set)",
-            outputPdf);
+            job.Profile.Driver ?? "(not set)");
 
         using var proc = new Process { StartInfo = psi, EnableRaisingEvents = true };
         var sw = Stopwatch.StartNew();
@@ -531,8 +619,9 @@ internal sealed class ScanJobProcessor : BackgroundService
         catch (Exception ex)
         {
             _logger.LogError(ex,
-                "Failed to start NAPS2 process job_id={JobId} naps2_path={Naps2Path} args={Args}",
+                "Failed to start NAPS2 process job_id={JobId} attempt_kind={AttemptKind} naps2_path={Naps2Path} args={Args}",
                 job.JobId,
+                attemptKind,
                 psi.FileName,
                 DiagnosticLogHelper.FormatArguments(psi.ArgumentList));
             throw;
@@ -562,13 +651,15 @@ internal sealed class ScanJobProcessor : BackgroundService
         var stdout = await stdoutTask;
         var stderr = await stderrTask;
         var exitCode = proc.ExitCode;
-
-        var outputExists = File.Exists(outputPdf);
-        var outputBytes = outputExists ? new FileInfo(outputPdf).Length : 0L;
+        var outputPath = psi.ArgumentList.LastOrDefault() ?? string.Empty;
+        var outputExists = !string.IsNullOrWhiteSpace(outputPath) && File.Exists(outputPath);
+        var outputBytes = outputExists ? new FileInfo(outputPath).Length : 0L;
+        var success = exitCode == 0 && outputExists && outputBytes > 0;
 
         _logger.LogInformation(
-            "NAPS2 finished job_id={JobId} exit={Exit} duration_ms={Duration} output_exists={OutputExists} output_bytes={OutputBytes} stdout={Stdout} stderr={Stderr}",
+            "NAPS2 finished job_id={JobId} attempt_kind={AttemptKind} exit={Exit} duration_ms={Duration} output_exists={OutputExists} output_bytes={OutputBytes} stdout={Stdout} stderr={Stderr}",
             job.JobId,
+            attemptKind,
             exitCode,
             sw.ElapsedMilliseconds,
             outputExists,
@@ -576,26 +667,22 @@ internal sealed class ScanJobProcessor : BackgroundService
             DiagnosticLogHelper.TruncateForLog(stdout),
             DiagnosticLogHelper.TruncateForLog(stderr));
 
-        if (exitCode != 0 || !outputExists || outputBytes == 0)
+        if (!success)
         {
-            job.ErrorCode = "scan_failed";
-            _logger.LogError(
-                "NAPS2 scan failed job_id={JobId} exit={Exit} output_exists={OutputExists} output_bytes={OutputBytes} profile_name={ProfileName} scanner_name={ScannerName} configured_driver={Driver} args={Args} stdout={Stdout} stderr={Stderr}",
+            _logger.LogWarning(
+                "NAPS2 attempt failed job_id={JobId} attempt_kind={AttemptKind} exit={Exit} output_exists={OutputExists} output_bytes={OutputBytes} args={Args}",
                 job.JobId,
+                attemptKind,
                 exitCode,
                 outputExists,
                 outputBytes,
-                job.Profile.ProfileName,
-                job.Profile.ScannerName,
-                job.Profile.Driver ?? "(not set)",
-                DiagnosticLogHelper.FormatArguments(psi.ArgumentList),
-                DiagnosticLogHelper.TruncateForLog(stdout),
-                DiagnosticLogHelper.TruncateForLog(stderr));
-            throw new InvalidOperationException("scan_failed");
+                DiagnosticLogHelper.FormatArguments(psi.ArgumentList));
         }
 
-        job.LocalFilePaths = new List<string> { outputPdf };
+        return new ScanAttemptResult(success, stdout, stderr);
     }
+
+    private readonly record struct ScanAttemptResult(bool IsSuccess, string Stdout, string Stderr);
 }
 
 internal static class DiagnosticLogHelper
@@ -619,6 +706,24 @@ internal static class DiagnosticLogHelper
         }
 
         return cleaned[..max] + "... (truncated)";
+    }
+
+    public static IEnumerable<string> GetWindowsDriverCandidates(string? preferredDriver)
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        if (!string.IsNullOrWhiteSpace(preferredDriver) && seen.Add(preferredDriver))
+        {
+            yield return preferredDriver;
+        }
+
+        foreach (var driver in new[] { "twain", "wia", "escl" })
+        {
+            if (seen.Add(driver))
+            {
+                yield return driver;
+            }
+        }
     }
 
     private static string QuoteArgument(string value)
