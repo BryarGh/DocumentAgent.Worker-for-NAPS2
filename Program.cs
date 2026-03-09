@@ -261,7 +261,11 @@ app.MapGet("/scan/{jobId}", (string jobId, ScanJobQueue queue) =>
         {
             job_id = job.JobId,
             status = job.Status.ToString().ToLowerInvariant(),
-            error_message = job.ErrorMessage
+            error_message = job.ErrorMessage,
+            error_code = job.ErrorCode,
+            attempt_kind = job.LastAttemptKind,
+            attempt_message = job.LastAttemptMessage,
+            updated_at = job.UpdatedUtc
         });
     }
 
@@ -335,6 +339,8 @@ internal sealed class ScanJob
     public int Attempts { get; set; }
     public List<string> LocalFilePaths { get; set; } = new();
     public string? ClientRequestId { get; set; }
+    public string? LastAttemptKind { get; set; }
+    public string? LastAttemptMessage { get; set; }
 }
 
 internal sealed class ScanJobQueue
@@ -415,16 +421,18 @@ internal sealed class ScanJobProcessor : BackgroundService
 {
     private readonly ScanJobQueue _queue;
     private readonly AppPaths _paths;
+    private readonly ScannerService _scannerService;
     private readonly ILogger<ScanJobProcessor> _logger;
     private readonly AppState _state;
     private readonly IUploadClient _uploader;
     private readonly AgentConfigProvider _config;
     private readonly TimeSpan _acquireTimeout = TimeSpan.FromMinutes(10);
 
-    public ScanJobProcessor(ScanJobQueue queue, AppPaths paths, AppState state, AgentConfigProvider config, IUploadClient uploader, ILogger<ScanJobProcessor> logger)
+    public ScanJobProcessor(ScanJobQueue queue, AppPaths paths, ScannerService scannerService, AppState state, AgentConfigProvider config, IUploadClient uploader, ILogger<ScanJobProcessor> logger)
     {
         _queue = queue;
         _paths = paths;
+        _scannerService = scannerService;
         _logger = logger;
         _state = state;
         _config = config;
@@ -439,6 +447,8 @@ internal sealed class ScanJobProcessor : BackgroundService
             {
                 job.Status = ScanJobStatus.Acquiring;
                 job.Attempts += 1;
+                job.LastAttemptKind = "acquiring";
+                job.LastAttemptMessage = "Starting acquisition";
                 _queue.Update(job);
                 _logger.LogInformation("Acquiring scan job {JobId}", job.JobId);
 
@@ -477,12 +487,21 @@ internal sealed class ScanJobProcessor : BackgroundService
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 job.Status = ScanJobStatus.Failed;
-                job.ErrorMessage = ex.Message;
+                if (string.IsNullOrWhiteSpace(job.ErrorMessage) ||
+                    string.Equals(job.ErrorMessage, "scan_failed", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(job.ErrorMessage, "scan_timeout", StringComparison.OrdinalIgnoreCase))
+                {
+                    job.ErrorMessage = ex.Message;
+                }
                 job.ErrorCode = ex is TimeoutException
                     ? "scan_timeout"
                     : ex.Message.StartsWith("upload_", StringComparison.OrdinalIgnoreCase)
                         ? "upload_failed"
                         : job.ErrorCode ?? "scan_failed";
+                if (string.IsNullOrWhiteSpace(job.LastAttemptKind))
+                {
+                    job.LastAttemptKind = "failed";
+                }
                 _queue.Update(job);
                 _state.ConsecutiveScanFailures += 1;
                 _logger.LogError(ex, "Scan job {JobId} failed", job.JobId);
@@ -500,11 +519,16 @@ internal sealed class ScanJobProcessor : BackgroundService
             throw new InvalidOperationException("naps2_not_configured");
         }
 
+        var acquireStartedAt = DateTime.UtcNow;
+        var acquireDeadline = acquireStartedAt + _acquireTimeout;
+
         var profileAttempt = BuildScanByProfileStartInfo(job, outputPdf);
-        var profileResult = await RunNaps2ScanAsync(job, profileAttempt, stoppingToken, "profile");
+        var profileResult = await RunNaps2ScanAsync(job, profileAttempt, stoppingToken, "profile", acquireDeadline);
         if (profileResult.IsSuccess)
         {
             job.LocalFilePaths = new List<string> { outputPdf };
+            job.LastAttemptKind = "profile";
+            job.LastAttemptMessage = "Acquisition succeeded using profile";
             return;
         }
 
@@ -515,27 +539,55 @@ internal sealed class ScanJobProcessor : BackgroundService
 
         if (shouldFallbackToDevice)
         {
+            if (IsImmediateDeviceFailure(profileResult.Stdout, profileResult.Stderr))
+            {
+                _logger.LogWarning(
+                    "Skipping fallback driver retries due to immediate device failure markers job_id={JobId} stdout={Stdout} stderr={Stderr}",
+                    job.JobId,
+                    DiagnosticLogHelper.TruncateForLog(profileResult.Stdout),
+                    DiagnosticLogHelper.TruncateForLog(profileResult.Stderr));
+            }
+
             _logger.LogWarning(
                 "Profile-based scan failed with unavailable/ambiguous profile. Retrying by scanner device name job_id={JobId} scanner_name={ScannerName}",
                 job.JobId,
                 job.Profile.ScannerName);
 
             var attemptedDrivers = new List<string>();
-            foreach (var driver in DiagnosticLogHelper.GetWindowsDriverCandidates(job.Profile.Driver))
+            foreach (var driver in GetDeviceFallbackDriverCandidates(job))
             {
+                if (DateTime.UtcNow >= acquireDeadline)
+                {
+                    _logger.LogWarning("Stopping fallback retries due to acquire timeout budget exhaustion job_id={JobId}", job.JobId);
+                    throw new TimeoutException("scan_timeout");
+                }
+
                 attemptedDrivers.Add(driver);
                 var deviceAttempt = BuildScanByDeviceStartInfo(job, outputPdf, driver);
-                var deviceResult = await RunNaps2ScanAsync(job, deviceAttempt, stoppingToken, $"device/{driver}");
+                var deviceResult = await RunNaps2ScanAsync(job, deviceAttempt, stoppingToken, $"device/{driver}", acquireDeadline, TimeSpan.FromSeconds(25));
                 if (deviceResult.IsSuccess)
                 {
                     job.Profile.Driver = driver;
                     job.LocalFilePaths = new List<string> { outputPdf };
+                    job.LastAttemptKind = $"device/{driver}";
+                    job.LastAttemptMessage = $"Acquisition succeeded using driver {driver}";
                     _logger.LogInformation(
                         "Device fallback scan succeeded job_id={JobId} scanner_name={ScannerName} driver={Driver}",
                         job.JobId,
                         job.Profile.ScannerName,
                         driver);
                     return;
+                }
+
+                if (IsImmediateDeviceFailure(deviceResult.Stdout, deviceResult.Stderr))
+                {
+                    _logger.LogWarning(
+                        "Stopping remaining fallback retries due to immediate device failure markers job_id={JobId} attempt_driver={Driver} stdout={Stdout} stderr={Stderr}",
+                        job.JobId,
+                        driver,
+                        DiagnosticLogHelper.TruncateForLog(deviceResult.Stdout),
+                        DiagnosticLogHelper.TruncateForLog(deviceResult.Stderr));
+                    break;
                 }
             }
 
@@ -544,10 +596,67 @@ internal sealed class ScanJobProcessor : BackgroundService
                 job.JobId,
                 job.Profile.ScannerName,
                 string.Join(",", attemptedDrivers));
+
+            var reason = DiagnosticLogHelper.ExtractPrimaryFailureReason(profileResult.Stdout, profileResult.Stderr);
+            job.LastAttemptKind = "device-fallback";
+            job.LastAttemptMessage = $"All fallback attempts failed ({string.Join(",", attemptedDrivers)})";
+            job.ErrorMessage = string.IsNullOrWhiteSpace(reason)
+                ? "scan_failed: device fallback attempts failed"
+                : $"scan_failed: {reason}";
         }
 
         job.ErrorCode = "scan_failed";
+        if (string.IsNullOrWhiteSpace(job.ErrorMessage))
+        {
+            var profileReason = DiagnosticLogHelper.ExtractPrimaryFailureReason(profileResult.Stdout, profileResult.Stderr);
+            job.ErrorMessage = string.IsNullOrWhiteSpace(profileReason)
+                ? "scan_failed"
+                : $"scan_failed: {profileReason}";
+        }
         throw new InvalidOperationException("scan_failed");
+    }
+
+    private IEnumerable<string> GetDeviceFallbackDriverCandidates(ScanJob job)
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        if (!string.IsNullOrWhiteSpace(job.Profile.Driver) && seen.Add(job.Profile.Driver))
+        {
+            yield return job.Profile.Driver;
+        }
+
+        var knownDrivers = _scannerService.GetScanners()
+            .Where(s => string.Equals(s.Name, job.Profile.ScannerName, StringComparison.OrdinalIgnoreCase))
+            .Select(s => s.Driver)
+            .Where(d => !string.IsNullOrWhiteSpace(d));
+
+        foreach (var driver in knownDrivers)
+        {
+            if (seen.Add(driver!))
+            {
+                yield return driver!;
+            }
+        }
+
+        if (seen.Count == 0)
+        {
+            foreach (var fallback in DiagnosticLogHelper.GetWindowsDriverCandidates(job.Profile.Driver))
+            {
+                if (seen.Add(fallback))
+                {
+                    yield return fallback;
+                }
+            }
+        }
+    }
+
+    private static bool IsImmediateDeviceFailure(string stdout, string stderr)
+    {
+        var text = (stdout + "\n" + stderr).ToLowerInvariant();
+        return text.Contains("no scanned pages to export")
+            || text.Contains("twain error: seqerror")
+            || text.Contains("paper jam")
+            || text.Contains("cover open");
     }
 
     private ProcessStartInfo BuildScanByProfileStartInfo(ScanJob job, string outputPdf)
@@ -594,8 +703,12 @@ internal sealed class ScanJobProcessor : BackgroundService
         return psi;
     }
 
-    private async Task<ScanAttemptResult> RunNaps2ScanAsync(ScanJob job, ProcessStartInfo psi, CancellationToken stoppingToken, string attemptKind)
+    private async Task<ScanAttemptResult> RunNaps2ScanAsync(ScanJob job, ProcessStartInfo psi, CancellationToken stoppingToken, string attemptKind, DateTime acquireDeadlineUtc, TimeSpan? perAttemptTimeout = null)
     {
+        job.LastAttemptKind = attemptKind;
+        job.LastAttemptMessage = $"Running {attemptKind}";
+        _queue.Update(job);
+
         _logger.LogInformation(
             "Launching NAPS2 scan job_id={JobId} attempt_kind={AttemptKind} naps2_path={Naps2Path} working_dir={WorkingDir} args={Args} profile_name={ProfileName} scanner_name={ScannerName} configured_driver={Driver}",
             job.JobId,
@@ -610,7 +723,18 @@ internal sealed class ScanJobProcessor : BackgroundService
         using var proc = new Process { StartInfo = psi, EnableRaisingEvents = true };
         var sw = Stopwatch.StartNew();
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
-        cts.CancelAfter(_acquireTimeout);
+
+        var remaining = acquireDeadlineUtc - DateTime.UtcNow;
+        if (remaining <= TimeSpan.Zero)
+        {
+            throw new TimeoutException("scan_timeout");
+        }
+
+        var thisAttemptTimeout = perAttemptTimeout is null
+            ? remaining
+            : (remaining < perAttemptTimeout.Value ? remaining : perAttemptTimeout.Value);
+
+        cts.CancelAfter(thisAttemptTimeout);
 
         try
         {
@@ -669,6 +793,12 @@ internal sealed class ScanJobProcessor : BackgroundService
 
         if (!success)
         {
+            var reason = DiagnosticLogHelper.ExtractPrimaryFailureReason(stdout, stderr);
+            job.LastAttemptMessage = string.IsNullOrWhiteSpace(reason)
+                ? $"{attemptKind} failed (exit {exitCode})"
+                : $"{attemptKind} failed: {reason}";
+            _queue.Update(job);
+
             _logger.LogWarning(
                 "NAPS2 attempt failed job_id={JobId} attempt_kind={AttemptKind} exit={Exit} output_exists={OutputExists} output_bytes={OutputBytes} args={Args}",
                 job.JobId,
@@ -677,6 +807,11 @@ internal sealed class ScanJobProcessor : BackgroundService
                 outputExists,
                 outputBytes,
                 DiagnosticLogHelper.FormatArguments(psi.ArgumentList));
+        }
+        else
+        {
+            job.LastAttemptMessage = $"{attemptKind} completed";
+            _queue.Update(job);
         }
 
         return new ScanAttemptResult(success, stdout, stderr);
@@ -724,6 +859,21 @@ internal static class DiagnosticLogHelper
                 yield return driver;
             }
         }
+    }
+
+    public static string ExtractPrimaryFailureReason(string? stdout, string? stderr)
+    {
+        var combined = string.Join("\n", new[] { stdout, stderr }.Where(v => !string.IsNullOrWhiteSpace(v))).Trim();
+        if (string.IsNullOrWhiteSpace(combined))
+        {
+            return string.Empty;
+        }
+
+        var firstLine = combined
+            .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
+            .FirstOrDefault()?.Trim();
+
+        return firstLine ?? string.Empty;
     }
 
     private static string QuoteArgument(string value)
