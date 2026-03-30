@@ -534,8 +534,7 @@ internal sealed class ScanJobProcessor : BackgroundService
 
         var shouldFallbackToDevice = OperatingSystem.IsWindows()
             && !string.IsNullOrWhiteSpace(job.Profile.ScannerName)
-            && (profileResult.Stdout.Contains("unavailable or ambiguous", StringComparison.OrdinalIgnoreCase)
-                || profileResult.Stderr.Contains("unavailable or ambiguous", StringComparison.OrdinalIgnoreCase));
+            && ShouldAttemptDeviceFallback(profileResult.Stdout, profileResult.Stderr);
 
         if (shouldFallbackToDevice)
         {
@@ -562,8 +561,19 @@ internal sealed class ScanJobProcessor : BackgroundService
                     throw new TimeoutException("scan_timeout");
                 }
 
+                var deviceName = ResolveDeviceNameForDriver(job, driver);
+                if (string.IsNullOrWhiteSpace(deviceName))
+                {
+                    _logger.LogWarning(
+                        "Skipping fallback driver due to no known device mapping job_id={JobId} scanner_name={ScannerName} driver={Driver}",
+                        job.JobId,
+                        job.Profile.ScannerName,
+                        driver);
+                    continue;
+                }
+
                 attemptedDrivers.Add(driver);
-                var deviceAttempt = BuildScanByDeviceStartInfo(job, outputPdf, driver);
+                var deviceAttempt = BuildScanByDeviceStartInfo(job, outputPdf, driver, deviceName);
                 var deviceResult = await RunNaps2ScanAsync(job, deviceAttempt, stoppingToken, $"device/{driver}", acquireDeadline, TimeSpan.FromSeconds(25));
                 if (deviceResult.IsSuccess)
                 {
@@ -638,14 +648,11 @@ internal sealed class ScanJobProcessor : BackgroundService
             }
         }
 
-        if (seen.Count == 0)
+        foreach (var fallback in DiagnosticLogHelper.GetWindowsDriverCandidates(job.Profile.Driver))
         {
-            foreach (var fallback in DiagnosticLogHelper.GetWindowsDriverCandidates(job.Profile.Driver))
+            if (seen.Add(fallback))
             {
-                if (seen.Add(fallback))
-                {
-                    yield return fallback;
-                }
+                yield return fallback;
             }
         }
     }
@@ -653,10 +660,82 @@ internal sealed class ScanJobProcessor : BackgroundService
     private static bool IsImmediateDeviceFailure(string stdout, string stderr)
     {
         var text = (stdout + "\n" + stderr).ToLowerInvariant();
-        return text.Contains("no scanned pages to export")
-            || text.Contains("twain error: seqerror")
-            || text.Contains("paper jam")
+        return text.Contains("paper jam")
             || text.Contains("cover open");
+    }
+
+    private static bool ShouldAttemptDeviceFallback(string stdout, string stderr)
+    {
+        var text = (stdout + "\n" + stderr).ToLowerInvariant();
+        // Trigger fallback on various profile/scanner failure patterns
+        return text.Contains("unavailable or ambiguous")
+            || text.Contains("could not be found")
+            || text.Contains("not found")
+            || text.Contains("no scanner")
+            || text.Contains("no device")
+            || text.Contains("device not found")
+            || text.Contains("scanner not found")
+            || text.Contains("no scanned pages")
+            || text.Contains("seqerror")
+            || text.Contains("sequence error");
+    }
+
+    private string ResolveDeviceNameForDriver(ScanJob job, string driver)
+    {
+        var scanners = _scannerService.GetScanners();
+        var profileName = job.Profile.ScannerName ?? string.Empty;
+
+        // 1. Exact match: profile scanner name + driver
+        var exact = scanners.FirstOrDefault(s =>
+            string.Equals(s.Driver, driver, StringComparison.OrdinalIgnoreCase)
+            && string.Equals(s.Name, profileName, StringComparison.OrdinalIgnoreCase));
+        if (exact is not null)
+        {
+            return exact.Name;
+        }
+
+        // 2. Any scanner discovered for this driver
+        var firstForDriver = scanners.FirstOrDefault(s =>
+            string.Equals(s.Driver, driver, StringComparison.OrdinalIgnoreCase));
+        if (firstForDriver is not null)
+        {
+            _logger.LogWarning(
+                "Using discovered device for driver job_id={JobId} requested_scanner={RequestedScanner} resolved_scanner={ResolvedScanner} driver={Driver}",
+                job.JobId,
+                profileName,
+                firstForDriver.Name,
+                driver);
+            return firstForDriver.Name;
+        }
+
+        // 3. Fallback: strip driver suffixes from profile name and use directly
+        // e.g. "HP ScanJet Pro 2500 f1 TWAIN" -> "HP ScanJet Pro 2500 f1"
+        var baseName = StripDriverSuffix(profileName);
+        _logger.LogWarning(
+            "No discovered device for driver, using stripped profile name job_id={JobId} profile_scanner={ProfileScanner} base_name={BaseName} driver={Driver}",
+            job.JobId,
+            profileName,
+            baseName,
+            driver);
+        return baseName;
+    }
+
+    private static string StripDriverSuffix(string scannerName)
+    {
+        if (string.IsNullOrWhiteSpace(scannerName))
+            return scannerName;
+
+        // Remove common driver suffixes that TWAIN/WIA/ESCL append
+        var suffixes = new[] { " TWAIN", " WIA", " ESCL", " (TWAIN)", " (WIA)", " (ESCL)" };
+        var result = scannerName.Trim();
+        foreach (var suffix in suffixes)
+        {
+            if (result.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
+            {
+                result = result[..^suffix.Length].Trim();
+            }
+        }
+        return result;
     }
 
     private ProcessStartInfo BuildScanByProfileStartInfo(ScanJob job, string outputPdf)
@@ -669,13 +748,13 @@ internal sealed class ScanJobProcessor : BackgroundService
         return psi;
     }
 
-    private ProcessStartInfo BuildScanByDeviceStartInfo(ScanJob job, string outputPdf, string driver)
+    private ProcessStartInfo BuildScanByDeviceStartInfo(ScanJob job, string outputPdf, string driver, string deviceName)
     {
         var psi = CreateBaseNaps2StartInfo(outputPdf);
         psi.ArgumentList.Add("--driver");
         psi.ArgumentList.Add(driver);
         psi.ArgumentList.Add("--device");
-        psi.ArgumentList.Add(job.Profile.ScannerName);
+        psi.ArgumentList.Add(deviceName);
         psi.ArgumentList.Add("--output");
         psi.ArgumentList.Add(outputPdf);
         return psi;
@@ -1366,14 +1445,30 @@ internal sealed class ScannerService
         try
         {
             // Windows uses TWAIN/WIA drivers; macOS uses Apple/SANE/ESCL; Linux uses SANE/ESCL.
+            // Note: ESCL is notoriously slow (can take 60+ seconds) and often returns empty,
+            // so we skip it on Windows once we find scanners via TWAIN or WIA.
             var drivers = OperatingSystem.IsWindows()
                 ? new[] { "twain", "wia", "escl" }
                 : OperatingSystem.IsMacOS()
                     ? new[] { "apple", "escl", "sane" }
                     : new[] { "sane", "escl" };
             var found = false;
+            var discovered = new List<ScannerInfo>();
+            
+            // Timeout per driver enumeration to prevent blocking (ESCL is especially slow)
+            var driverTimeout = TimeSpan.FromSeconds(10);
+            
             foreach (var driver in drivers)
             {
+                // Skip ESCL on Windows if we already found scanners via faster drivers
+                if (string.Equals(driver, "escl", StringComparison.OrdinalIgnoreCase) 
+                    && OperatingSystem.IsWindows() 
+                    && discovered.Count > 0)
+                {
+                    _logger.LogInformation("Skipping ESCL enumeration — already found {Count} scanner(s) via faster drivers", discovered.Count);
+                    continue;
+                }
+                
                 var psi = new ProcessStartInfo
                 {
                     FileName = _config.Config.Naps2Path!,
@@ -1395,9 +1490,33 @@ internal sealed class ScannerService
 
                 using var proc = new Process { StartInfo = psi };
                 proc.Start();
-                var stdout = proc.StandardOutput.ReadToEnd();
-                var stderr = proc.StandardError.ReadToEnd();
-                proc.WaitForExit();
+                
+                // Read output with timeout to prevent blocking on slow drivers
+                var readTask = Task.Run(() =>
+                {
+                    var stdout = proc.StandardOutput.ReadToEnd();
+                    var stderr = proc.StandardError.ReadToEnd();
+                    return (stdout, stderr);
+                });
+                
+                string stdout, stderr;
+                if (readTask.Wait(driverTimeout))
+                {
+                    (stdout, stderr) = readTask.Result;
+                    proc.WaitForExit(1000); // Brief wait for process to fully exit
+                }
+                else
+                {
+                    // Timeout - kill the process and skip this driver
+                    _logger.LogWarning("NAPS2 listdevices for driver {Driver} timed out after {Timeout}s — killing process", 
+                        driver, driverTimeout.TotalSeconds);
+                    try
+                    {
+                        proc.Kill(entireProcessTree: true);
+                    }
+                    catch { /* ignore kill errors */ }
+                    continue;
+                }
 
                 _logger.LogInformation(
                     "NAPS2 listdevices driver={Driver} exit={Exit} stdout={Stdout} stderr={Stderr}",
@@ -1421,22 +1540,24 @@ internal sealed class ScannerService
                     continue;
                 }
 
-                lock (_sync)
+                found = true;
+
+                for (var i = 0; i < lines.Count; i++)
                 {
-                    _scanners.Clear();
-                    for (var i = 0; i < lines.Count; i++)
+                    var name = lines[i];
+                    if (!discovered.Any(s =>
+                        string.Equals(s.Name, name, StringComparison.OrdinalIgnoreCase)
+                        && string.Equals(s.Driver, driver, StringComparison.OrdinalIgnoreCase)))
                     {
-                        _scanners.Add(new ScannerInfo
+                        discovered.Add(new ScannerInfo
                         {
-                            Name = lines[i],
+                            Name = name,
                             Driver = driver,
-                            IsDefault = i == 0,
+                            IsDefault = discovered.Count == 0,
                             LastSeenAt = DateTime.UtcNow
                         });
                     }
                 }
-
-                found = true;
 
                 // Auto-create a default profile for any newly discovered scanner
                 // that doesn't already have one, so users don't need to POST /profiles manually.
@@ -1459,8 +1580,6 @@ internal sealed class ScannerService
                         _logger.LogInformation("Auto-created default profile for scanner {Scanner}", scanner);
                     }
                 }
-
-                break;
             }
 
             if (!found)
@@ -1469,6 +1588,13 @@ internal sealed class ScannerService
                 {
                     _scanners.Clear();
                 }
+                return;
+            }
+
+            lock (_sync)
+            {
+                _scanners.Clear();
+                _scanners.AddRange(discovered);
             }
         }
         catch (Exception ex)

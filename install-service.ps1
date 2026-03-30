@@ -52,11 +52,11 @@ $ExePublished = Join-Path $PublishDir "DocumentAgent.Worker.exe"
 if (Test-Path $ExeNextToScript) {
     # ── End-user mode: exe already here, install directly ───────────────────
     $ExePath = $ExeNextToScript
-    Write-Host "Found exe next to script — installing directly (no build needed)."
+    Write-Host "Found exe next to script - installing directly (no build needed)."
 
 } elseif (Test-Path $CsprojPath) {
     # ── Developer mode: publish from source ─────────────────────────────────
-    Write-Host "Publishing self-contained Windows executable (this takes ~30 s)..."
+    Write-Host "Publishing self-contained Windows executable (this takes about 30 seconds)..."
     dotnet publish "$CsprojPath" `
         --configuration Release `
         --runtime win-x64 `
@@ -116,7 +116,7 @@ sc.exe create $ServiceName `
 
 sc.exe description $ServiceName "$ServiceDesc"
 
-# Auto-restart on failure: 3 attempts, 60 s delay each, reset counter after 24 h
+# Auto-restart on failure: 3 attempts, 60 second delay each, reset counter after 24 hours
 sc.exe failure $ServiceName reset= 86400 actions= restart/60000/restart/60000/restart/60000
 
 Write-Host "Starting service..."
