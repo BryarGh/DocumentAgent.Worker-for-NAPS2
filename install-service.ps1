@@ -1,17 +1,17 @@
-# DocumentAgent Windows Service — Install / Uninstall
+# DocumentAgent Windows Service -- Install / Uninstall
 #
-# ── FOR END USERS (no source code / no SDK needed) ──────────────────────────
+# -- FOR END USERS (no source code / no SDK needed) --------------------------
 #   1. Copy DocumentAgent.Worker.exe and this script into the same folder
 #      (e.g. D:\DocumentAgent\)
-#   2. Right-click PowerShell → Run as Administrator
+#   2. Right-click PowerShell -> Run as Administrator
 #   3. cd to that folder, then:  .\install-service.ps1
 #
-# ── FOR DEVELOPERS (building from source) ───────────────────────────────────
+# -- FOR DEVELOPERS (building from source) -----------------------------------
 #   Run from the project root (where .csproj lives):
-#   .\install-service.ps1          — publishes then installs
-#   .\install-service.ps1 -Publish — only publishes to .\publish\, does not install
+#   .\install-service.ps1          -- publishes then installs
+#   .\install-service.ps1 -Publish -- only publishes to .\publish\, does not install
 #
-# ── UNINSTALL ────────────────────────────────────────────────────────────────
+# -- UNINSTALL ----------------------------------------------------------------
 #   .\install-service.ps1 -Uninstall
 
 param(
@@ -19,18 +19,23 @@ param(
     [switch]$Publish   # developer-only: publish without installing
 )
 
+# Prevent silent script termination from non-terminating errors.
+$ErrorActionPreference = 'Continue'
+
+$PublishRequested = $PSBoundParameters.ContainsKey('Publish') -and $Publish.IsPresent
+
 $ServiceName    = "DocumentAgent"
 $ServiceDisplay = "Document Agent (NAPS2 Scanner)"
 $ServiceDesc    = "Loopback scanning agent that drives NAPS2 and uploads scanned PDFs to your Laravel server."
 
-# ── Require Administrator ────────────────────────────────────────────────────
+# -- Require Administrator ----------------------------------------------------
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
         [Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Write-Error "Please run this script as Administrator (right-click PowerShell → Run as Administrator)."
+    Write-Host "ERROR: Please run this script as Administrator (right-click PowerShell -> Run as Administrator)." -ForegroundColor Red
     exit 1
 }
 
-# ── Uninstall ────────────────────────────────────────────────────────────────
+# -- Uninstall ----------------------------------------------------------------
 if ($Uninstall) {
     Write-Host "Stopping service '$ServiceName'..."
     sc.exe stop $ServiceName 2>$null
@@ -40,23 +45,31 @@ if ($Uninstall) {
     exit 0
 }
 
-# ── Locate the exe ───────────────────────────────────────────────────────────
+# -- Locate the exe -----------------------------------------------------------
 # Mode A: exe sits next to this script (end-user distribution)
 $ExeNextToScript = Join-Path $PSScriptRoot "DocumentAgent.Worker.exe"
 
-# Mode B: running from source — publish first, exe lands in .\publish\
+# Mode B: running from source -- publish first, exe lands in .\publish\
 $CsprojPath   = Join-Path $PSScriptRoot "DocumentAgent.Worker.csproj"
 $PublishDir   = Join-Path $PSScriptRoot "publish"
 $ExePublished = Join-Path $PublishDir "DocumentAgent.Worker.exe"
 
 if (Test-Path $ExeNextToScript) {
-    # ── End-user mode: exe already here, install directly ───────────────────
+    # -- End-user mode: exe already here, install directly -------------------
     $ExePath = $ExeNextToScript
-    Write-Host "Found exe next to script - installing directly (no build needed)."
+    Write-Host "[1/6] Install mode: end-user (exe next to script)" -ForegroundColor Cyan
 
 } elseif (Test-Path $CsprojPath) {
-    # ── Developer mode: publish from source ─────────────────────────────────
-    Write-Host "Publishing self-contained Windows executable (this takes about 30 seconds)..."
+    # -- Developer mode: publish from source ---------------------------------
+    Write-Host "[1/6] Install mode: developer (building from source)" -ForegroundColor Cyan
+    Write-Host "       Publish-only: $PublishRequested"
+
+    if (Test-Path $PublishDir) {
+        Write-Host "       Cleaning previous publish output..."
+        Remove-Item -Path $PublishDir -Recurse -Force
+    }
+
+    Write-Host "       Publishing self-contained Windows executable..."
     dotnet publish "$CsprojPath" `
         --configuration Release `
         --runtime win-x64 `
@@ -66,13 +79,13 @@ if (Test-Path $ExeNextToScript) {
         /p:IncludeNativeLibrariesForSelfExtract=true
 
     if ($LASTEXITCODE -ne 0) {
-        Write-Error "dotnet publish failed. Fix build errors and try again."
+        Write-Host "ERROR: dotnet publish failed (exit $LASTEXITCODE). Fix build errors and try again." -ForegroundColor Red
         exit 1
     }
 
     $ExePath = $ExePublished
 
-    if ($Publish) {
+    if ($PublishRequested) {
         Write-Host ""
         Write-Host "Published to: $PublishDir"
         Write-Host "Copy DocumentAgent.Worker.exe and install-service.ps1 to each laptop, then run the script as Administrator."
@@ -80,64 +93,110 @@ if (Test-Path $ExeNextToScript) {
     }
 
 } else {
-    Write-Error @"
-Cannot find DocumentAgent.Worker.exe or DocumentAgent.Worker.csproj next to this script.
-
-End-user setup:
-  Place DocumentAgent.Worker.exe in the same folder as this script, then re-run.
-
-Developer setup:
-  Run this script from the project folder that contains DocumentAgent.Worker.csproj.
-"@
+    Write-Host "ERROR: Cannot find DocumentAgent.Worker.exe or .csproj next to this script." -ForegroundColor Red
     exit 1
 }
 
 if (-not (Test-Path $ExePath)) {
-    Write-Error "Exe not found at: $ExePath"
+    Write-Host "ERROR: Exe not found at: $ExePath" -ForegroundColor Red
     exit 1
 }
 
-# ── Remove existing service if present ──────────────────────────────────────
-sc.exe query $ServiceName 2>$null | Out-Null
-if ($LASTEXITCODE -eq 0) {
-    Write-Host "Existing service found — stopping and removing..."
-    sc.exe stop $ServiceName 2>$null
+Write-Host "[2/6] Exe located: $ExePath" -ForegroundColor Cyan
+
+# -- Remove existing service if present --------------------------------------
+Write-Host "[3/6] Checking for existing service..." -ForegroundColor Cyan
+$existingService = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+if ($null -ne $existingService) {
+    Write-Host "       Existing service found (Status=$($existingService.Status)) -- removing..."
+    sc.exe stop $ServiceName 2>$null | Out-Null
     Start-Sleep -Seconds 2
-    sc.exe delete $ServiceName
-    Start-Sleep -Seconds 1
+    sc.exe delete $ServiceName 2>$null | Out-Null
+    Start-Sleep -Seconds 2
+    Write-Host "       Old service removed."
+} else {
+    Write-Host "       No existing service -- clean install."
 }
 
-# ── Install and start ────────────────────────────────────────────────────────
-Write-Host "Installing Windows Service '$ServiceName'..."
-sc.exe create $ServiceName `
-    binPath= "`"$ExePath`"" `
-    DisplayName= "$ServiceDisplay" `
-    start= auto
+# -- Create service ----------------------------------------------------------
+Write-Host "[4/6] Creating Windows Service..." -ForegroundColor Cyan
 
-sc.exe description $ServiceName "$ServiceDesc"
+$binPathArg = "binPath= `"$ExePath`""
+$displayArg = "DisplayName= `"$ServiceDisplay`""
+$startArg   = "start= auto"
 
-# Auto-restart on failure: 3 attempts, 60 second delay each, reset counter after 24 hours
-sc.exe failure $ServiceName reset= 86400 actions= restart/60000/restart/60000/restart/60000
+$createCmd = "sc.exe create $ServiceName $binPathArg $displayArg $startArg"
+Write-Host "       Command: $createCmd"
 
-Write-Host "Starting service..."
-sc.exe start $ServiceName
+# Use cmd /c to avoid PowerShell argument-mangling with sc.exe
+cmd /c "sc.exe create $ServiceName binPath= `"$ExePath`" DisplayName= `"$ServiceDisplay`" start= auto"
+$createExit = $LASTEXITCODE
+Write-Host "       sc.exe create exit code: $createExit"
+
+if ($createExit -ne 0) {
+    Write-Host "FAILED: sc.exe create returned $createExit" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "Try this manually:" -ForegroundColor Yellow
+    Write-Host "  sc.exe create $ServiceName binPath= `"$ExePath`" start= auto"
+    Write-Host ""
+    Write-Host "If you see error 1072, wait 10 seconds (or reboot) and retry."
+    exit 1
+}
+
+# Set description
+cmd /c "sc.exe description $ServiceName `"$ServiceDesc`""
+Write-Host "       Description set (exit $LASTEXITCODE)"
+
+# Auto-restart on failure
+cmd /c "sc.exe failure $ServiceName reset= 86400 actions= restart/60000/restart/60000/restart/60000"
+Write-Host "       Failure recovery set (exit $LASTEXITCODE)"
+
+# -- Verify service was created ----------------------------------------------
+Write-Host "[5/6] Verifying service exists..." -ForegroundColor Cyan
+$created = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+if ($null -eq $created) {
+    Write-Host "FAILED: Service '$ServiceName' not found after create!" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "Run these for diagnostics:" -ForegroundColor Yellow
+    Write-Host "  sc.exe qc $ServiceName"
+    Write-Host "  Get-WinEvent -LogName System -MaxEvents 30 | Where-Object { `$_.Message -match 'DocumentAgent' }"
+    exit 1
+}
+Write-Host "       Service exists: Name=$($created.Name) Status=$($created.Status) StartType=$($created.StartType)"
+
+# -- Start service -----------------------------------------------------------
+Write-Host "[6/6] Starting service..." -ForegroundColor Cyan
+cmd /c "sc.exe start $ServiceName"
+$startExit = $LASTEXITCODE
+Write-Host "       sc.exe start exit code: $startExit"
 Start-Sleep -Seconds 3
-sc.exe query $ServiceName
 
+$running = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+$finalStatus = if ($null -ne $running) { $running.Status } else { "NOT FOUND" }
+Write-Host "       Service status: $finalStatus"
+
+if ($startExit -ne 0) {
+    Write-Host "WARNING: Service created but failed to start (exit $startExit)." -ForegroundColor Yellow
+    Write-Host "         Check logs at: $env:USERPROFILE\Documents\DocumentAgent\logs"
+    Write-Host "         Or Event Viewer > Windows Logs > Application"
+}
+
+# -- Summary -----------------------------------------------------------------
 $ConfigPath = "$env:USERPROFILE\Documents\DocumentAgent\agent.config.json"
 $LogPath    = "$env:USERPROFILE\Documents\DocumentAgent\logs"
 
 Write-Host ""
-Write-Host "=========================================="
-Write-Host " DocumentAgent installed successfully"
-Write-Host "=========================================="
+Write-Host "==========================================" -ForegroundColor Green
+Write-Host " DocumentAgent installed successfully" -ForegroundColor Green
+Write-Host "==========================================" -ForegroundColor Green
 Write-Host " Exe:     $ExePath"
 Write-Host " Config:  $ConfigPath"
 Write-Host " Logs:    $LogPath"
+Write-Host " Status:  $finalStatus"
 Write-Host ""
 
 if (-not (Test-Path $ConfigPath)) {
-    Write-Host "NEXT STEP: Create the config file at:"
+    Write-Host "NEXT STEP: Create the config file at:" -ForegroundColor Yellow
     Write-Host "  $ConfigPath"
     Write-Host ""
     Write-Host "Example content:"
@@ -148,9 +207,9 @@ if (-not (Test-Path $ConfigPath)) {
   "laravel_origin": "http://192.168.33.50"
 }'
     Write-Host ""
-    Write-Host "Then restart the service:  sc.exe restart DocumentAgent"
+    Write-Host "Then restart the service:  Restart-Service $ServiceName"
 } else {
-    Write-Host "Config file already exists — service is ready."
+    Write-Host "Config file already exists -- service is ready."
 }
 
 Write-Host ""
