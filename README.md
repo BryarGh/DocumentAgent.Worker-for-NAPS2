@@ -149,16 +149,33 @@ Follow these steps on Windows machines to install and run the agent reliably, an
 .\install-service.ps1
 ```
 
-- If PowerShell blocks the script, use one of these (Administrator):
+- If PowerShell blocks the script (error: "cannot be loaded because running scripts is disabled"), the system execution policy is set to `Restricted`. Choose ONE of these solutions (all require Administrator):
+
+**Solution 1: Temporary bypass (recommended for single use)**
 
 ```powershell
-# Temporary bypass
-powershell -NoProfile -ExecutionPolicy Bypass -File "C:\path\to\install-service.ps1"
-
-# Or unblock then run
-Unblock-File -Path "C:\path\to\install-service.ps1"
+# Run from elevated PowerShell or CMD
 powershell -NoProfile -ExecutionPolicy Bypass -File "C:\path\to\install-service.ps1"
 ```
+
+**Solution 2: Permanent policy change (recommended for ongoing use)**
+
+```powershell
+# OR change the policy permanently (elevated PowerShell)
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser -Force
+.\install-service.ps1
+```
+
+**Solution 3: Unblock file + bypass (only if file was downloaded)**
+
+```powershell
+# If the file came from the internet and has a Zone.Identifier attribute
+Unblock-File -Path "C:\path\to\install-service.ps1"
+# Then run with bypass (the unblock alone won't work if policy is Restricted)
+powershell -NoProfile -ExecutionPolicy Bypass -File "C:\path\to\install-service.ps1"
+```
+
+Reference: [PowerShell Execution Policies](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_execution_policies)
 
 - Common mistakes & fixes
 
