@@ -33,6 +33,9 @@ Agent data directories are under `~/Documents/DocumentAgent` by default (config,
   "agent_token": "YOUR_TOKEN",
   "laravel_origin": "http://192.168.33.50",
   "whatsapp_enabled": true,
+  "whatsapp_credentials_source": "igms_with_fallback",
+  "whatsapp_credentials_url": "https://your-app.test/api/document-agent/whatsapp/credentials",
+  "whatsapp_credentials_ttl_seconds": 900,
   "twilio_account_sid": "ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
   "twilio_auth_token": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
   "twilio_whatsapp_from": "whatsapp:+14155238886",
@@ -50,6 +53,9 @@ Agent data directories are under `~/Documents/DocumentAgent` by default (config,
   "agent_token": "YOUR_TOKEN",
   "laravel_origin": "http://192.168.33.50",
   "whatsapp_enabled": true,
+  "whatsapp_credentials_source": "igms_with_fallback",
+  "whatsapp_credentials_url": "https://your-app.test/api/document-agent/whatsapp/credentials",
+  "whatsapp_credentials_ttl_seconds": 900,
   "twilio_account_sid": "ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
   "twilio_auth_token": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
   "twilio_whatsapp_from": "whatsapp:+14155238886",
@@ -61,6 +67,21 @@ Agent data directories are under `~/Documents/DocumentAgent` by default (config,
 ## CORS / Allowed Origin
 
 The agent reads `laravel_origin` from `agent.config.json` and uses it as the allowed CORS origin automatically — no extra environment variables needed. Set it to the address your users open in their browser (your Laravel server).
+
+## WhatsApp Credential Source Modes
+
+The worker supports centralized Twilio credentials from IGMS Settings with safe fallback:
+
+- `whatsapp_credentials_source: "local"`
+  - Uses only `twilio_account_sid`, `twilio_auth_token`, and `twilio_whatsapp_from` from local JSON.
+- `whatsapp_credentials_source: "igms_with_fallback"` (recommended)
+  - Fetches credentials from `whatsapp_credentials_url` using `agent_token` bearer auth.
+  - Caches credentials in memory for `whatsapp_credentials_ttl_seconds`.
+  - Falls back to local JSON credentials if IGMS is temporarily unreachable.
+- `whatsapp_credentials_source: "igms"`
+  - Uses IGMS credentials only, with no local fallback.
+
+When credentials are fetched successfully from IGMS, the worker mirrors effective values into `agent.config.json` keys for operational continuity.
 
 Fallback order:
 

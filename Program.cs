@@ -96,6 +96,7 @@ builder.Services.AddSingleton<IUploadClient, HttpUploadClient>();
 builder.Services.AddHostedService<ScanJobProcessor>();
 builder.Services.AddSingleton<PersistentWhatsAppMessageStore>();
 builder.Services.AddSingleton<WhatsAppMessageQueue>();
+builder.Services.AddSingleton<IWhatsAppRuntimeCredentialProvider, WhatsAppRuntimeCredentialProvider>();
 builder.Services.AddSingleton<IWhatsAppSender, TwilioWhatsAppSender>();
 builder.Services.AddHostedService<WhatsAppMessageProcessor>();
 builder.Services.AddHostedService<CleanupService>();
@@ -572,10 +573,12 @@ internal interface IWhatsAppSender
 internal sealed class TwilioWhatsAppSender : IWhatsAppSender
 {
     private readonly AgentConfigProvider _config;
+    private readonly IWhatsAppRuntimeCredentialProvider _credentialProvider;
 
-    public TwilioWhatsAppSender(AgentConfigProvider config)
+    public TwilioWhatsAppSender(AgentConfigProvider config, IWhatsAppRuntimeCredentialProvider credentialProvider)
     {
         _config = config;
+        _credentialProvider = credentialProvider;
     }
 
     public async Task<string> SendAsync(WhatsAppMessage message, CancellationToken cancellationToken)
@@ -585,17 +588,23 @@ internal sealed class TwilioWhatsAppSender : IWhatsAppSender
             throw new InvalidOperationException("whatsapp_disabled");
         }
 
-        if (string.IsNullOrWhiteSpace(_config.Config.TwilioAccountSid)
-            || string.IsNullOrWhiteSpace(_config.Config.TwilioAuthToken)
-            || string.IsNullOrWhiteSpace(_config.Config.TwilioWhatsAppFrom))
+        var runtimeCredentials = await _credentialProvider.GetAsync(cancellationToken);
+        if (runtimeCredentials is null || !runtimeCredentials.Enabled)
+        {
+            throw new InvalidOperationException("whatsapp_disabled");
+        }
+
+        if (string.IsNullOrWhiteSpace(runtimeCredentials.TwilioAccountSid)
+            || string.IsNullOrWhiteSpace(runtimeCredentials.TwilioAuthToken)
+            || string.IsNullOrWhiteSpace(runtimeCredentials.TwilioWhatsAppFrom))
         {
             throw new InvalidOperationException("twilio_not_configured");
         }
 
         var to = NormalizeWhatsAppAddress(message.PhoneNumber);
-        var from = NormalizeWhatsAppAddress(_config.Config.TwilioWhatsAppFrom);
+        var from = NormalizeWhatsAppAddress(runtimeCredentials.TwilioWhatsAppFrom);
 
-        TwilioClient.Init(_config.Config.TwilioAccountSid, _config.Config.TwilioAuthToken);
+        TwilioClient.Init(runtimeCredentials.TwilioAccountSid, runtimeCredentials.TwilioAuthToken);
 
         var created = await MessageResource.CreateAsync(
             to: new PhoneNumber(to),
@@ -1341,6 +1350,15 @@ internal sealed class AgentConfig
     [JsonPropertyName("whatsapp_enabled")]
     public bool WhatsAppEnabled { get; set; } = false;
 
+    [JsonPropertyName("whatsapp_credentials_source")]
+    public string? WhatsAppCredentialsSource { get; set; } = "local";
+
+    [JsonPropertyName("whatsapp_credentials_url")]
+    public string? WhatsAppCredentialsUrl { get; set; }
+
+    [JsonPropertyName("whatsapp_credentials_ttl_seconds")]
+    public int WhatsAppCredentialsTtlSeconds { get; set; } = 900;
+
     [JsonPropertyName("twilio_account_sid")]
     public string? TwilioAccountSid { get; set; }
 
@@ -1355,6 +1373,213 @@ internal sealed class AgentConfig
 
     [JsonPropertyName("whatsapp_timeout_seconds")]
     public int WhatsAppTimeoutSeconds { get; set; } = 30;
+}
+
+internal sealed class RuntimeWhatsAppCredentials
+{
+    public bool Enabled { get; init; }
+
+    public string? TwilioAccountSid { get; init; }
+
+    public string? TwilioAuthToken { get; init; }
+
+    public string? TwilioWhatsAppFrom { get; init; }
+
+    public int Version { get; init; }
+}
+
+internal sealed class WhatsAppCredentialApiResponse
+{
+    [JsonPropertyName("ok")]
+    public bool Ok { get; set; }
+
+    [JsonPropertyName("version")]
+    public int Version { get; set; }
+
+    [JsonPropertyName("ttl_seconds")]
+    public int TtlSeconds { get; set; }
+
+    [JsonPropertyName("credentials")]
+    public WhatsAppCredentialApiPayload? Credentials { get; set; }
+}
+
+internal sealed class WhatsAppCredentialApiPayload
+{
+    [JsonPropertyName("enabled")]
+    public bool Enabled { get; set; }
+
+    [JsonPropertyName("twilio_account_sid")]
+    public string? TwilioAccountSid { get; set; }
+
+    [JsonPropertyName("twilio_auth_token")]
+    public string? TwilioAuthToken { get; set; }
+
+    [JsonPropertyName("twilio_whatsapp_from")]
+    public string? TwilioWhatsAppFrom { get; set; }
+}
+
+internal interface IWhatsAppRuntimeCredentialProvider
+{
+    Task<RuntimeWhatsAppCredentials?> GetAsync(CancellationToken cancellationToken);
+}
+
+internal sealed class WhatsAppRuntimeCredentialProvider : IWhatsAppRuntimeCredentialProvider
+{
+    private readonly AgentConfigProvider _configProvider;
+    private readonly IHttpClientFactory _httpClientFactory;
+    private readonly ILogger<WhatsAppRuntimeCredentialProvider> _logger;
+    private readonly object _sync = new();
+
+    private RuntimeWhatsAppCredentials? _cached;
+    private DateTime _expiresUtc = DateTime.MinValue;
+
+    public WhatsAppRuntimeCredentialProvider(
+        AgentConfigProvider configProvider,
+        IHttpClientFactory httpClientFactory,
+        ILogger<WhatsAppRuntimeCredentialProvider> logger)
+    {
+        _configProvider = configProvider;
+        _httpClientFactory = httpClientFactory;
+        _logger = logger;
+    }
+
+    public async Task<RuntimeWhatsAppCredentials?> GetAsync(CancellationToken cancellationToken)
+    {
+        var cfg = _configProvider.Config;
+        var source = (cfg.WhatsAppCredentialsSource ?? "local").Trim().ToLowerInvariant();
+
+        if (source == "local")
+        {
+            return LocalCredentials(cfg);
+        }
+
+        if (source is "igms" or "igms_with_fallback")
+        {
+            if (TryGetCached(out var cached))
+            {
+                return cached;
+            }
+
+            var fetched = await TryFetchFromIgmsAsync(cfg, cancellationToken);
+            if (fetched is not null)
+            {
+                return fetched;
+            }
+
+            if (source == "igms_with_fallback")
+            {
+                _logger.LogWarning("Using local WhatsApp credentials fallback because IGMS fetch failed.");
+                return LocalCredentials(cfg);
+            }
+
+            return null;
+        }
+
+        return LocalCredentials(cfg);
+    }
+
+    private bool TryGetCached(out RuntimeWhatsAppCredentials? credentials)
+    {
+        lock (_sync)
+        {
+            if (_cached is not null && DateTime.UtcNow < _expiresUtc)
+            {
+                credentials = _cached;
+                return true;
+            }
+        }
+
+        credentials = null;
+        return false;
+    }
+
+    private async Task<RuntimeWhatsAppCredentials?> TryFetchFromIgmsAsync(AgentConfig cfg, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(cfg.WhatsAppCredentialsUrl))
+        {
+            _logger.LogWarning("whatsapp_credentials_url is missing while source is configured for IGMS.");
+            return null;
+        }
+
+        try
+        {
+            var separator = cfg.WhatsAppCredentialsUrl.Contains('?') ? "&" : "?";
+            var url = cfg.WhatsAppCredentialsUrl + separator + "machine_uuid=" + Uri.EscapeDataString(Environment.MachineName);
+
+            var client = _httpClientFactory.CreateClient();
+            client.Timeout = TimeSpan.FromSeconds(Math.Max(5, cfg.WhatsAppTimeoutSeconds));
+
+            using var request = new HttpRequestMessage(HttpMethod.Get, url);
+            if (!string.IsNullOrWhiteSpace(cfg.AgentToken))
+            {
+                request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", cfg.AgentToken);
+            }
+
+            using var response = await client.SendAsync(request, cancellationToken);
+            if (!response.IsSuccessStatusCode)
+            {
+                _logger.LogWarning("IGMS credential fetch failed with status {StatusCode}", (int) response.StatusCode);
+                return null;
+            }
+
+            var body = await response.Content.ReadAsStringAsync(cancellationToken);
+            var parsed = JsonSerializer.Deserialize<WhatsAppCredentialApiResponse>(body, new JsonSerializerOptions(JsonSerializerDefaults.Web));
+            if (parsed?.Credentials is null)
+            {
+                _logger.LogWarning("IGMS credential fetch response missing credential payload.");
+                return null;
+            }
+
+            var runtime = new RuntimeWhatsAppCredentials
+            {
+                Enabled = parsed.Credentials.Enabled,
+                TwilioAccountSid = parsed.Credentials.TwilioAccountSid?.Trim(),
+                TwilioAuthToken = parsed.Credentials.TwilioAuthToken?.Trim(),
+                TwilioWhatsAppFrom = parsed.Credentials.TwilioWhatsAppFrom?.Trim(),
+                Version = parsed.Version,
+            };
+
+            if (runtime.Enabled
+                && (string.IsNullOrWhiteSpace(runtime.TwilioAccountSid)
+                    || string.IsNullOrWhiteSpace(runtime.TwilioAuthToken)
+                    || string.IsNullOrWhiteSpace(runtime.TwilioWhatsAppFrom)))
+            {
+                _logger.LogWarning("IGMS credential payload is incomplete while enabled=true; refusing payload and preserving fallback.");
+                return null;
+            }
+
+            var ttl = parsed.TtlSeconds > 0
+                ? parsed.TtlSeconds
+                : Math.Max(30, cfg.WhatsAppCredentialsTtlSeconds);
+
+            lock (_sync)
+            {
+                _cached = runtime;
+                _expiresUtc = DateTime.UtcNow.AddSeconds(ttl);
+            }
+
+            _configProvider.PersistFetchedWhatsAppCredentials(runtime);
+
+            return runtime;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to fetch WhatsApp credentials from IGMS.");
+            return null;
+        }
+    }
+
+    private static RuntimeWhatsAppCredentials LocalCredentials(AgentConfig cfg)
+    {
+        return new RuntimeWhatsAppCredentials
+        {
+            Enabled = cfg.WhatsAppEnabled,
+            TwilioAccountSid = cfg.TwilioAccountSid,
+            TwilioAuthToken = cfg.TwilioAuthToken,
+            TwilioWhatsAppFrom = cfg.TwilioWhatsAppFrom,
+            Version = 0,
+        };
+    }
 }
 
 internal sealed class AgentConfigProvider
@@ -1398,6 +1623,10 @@ internal sealed class AgentConfigProvider
                 Config.TwilioAuthToken = StripInvisibleChars(Config.TwilioAuthToken);
             if (Config.TwilioWhatsAppFrom is not null)
                 Config.TwilioWhatsAppFrom = StripInvisibleChars(Config.TwilioWhatsAppFrom);
+            if (Config.WhatsAppCredentialsUrl is not null)
+                Config.WhatsAppCredentialsUrl = StripInvisibleChars(Config.WhatsAppCredentialsUrl);
+            if (Config.WhatsAppCredentialsSource is not null)
+                Config.WhatsAppCredentialsSource = StripInvisibleChars(Config.WhatsAppCredentialsSource);
 
             return Config;
         }
@@ -1466,6 +1695,53 @@ internal sealed class AgentConfigProvider
                 // Throw the original, more meaningful exception.
                 throw firstEx;
             }
+        }
+    }
+
+    public void PersistFetchedWhatsAppCredentials(RuntimeWhatsAppCredentials credentials)
+    {
+        try
+        {
+            if (credentials.Enabled
+                && (string.IsNullOrWhiteSpace(credentials.TwilioAccountSid)
+                    || string.IsNullOrWhiteSpace(credentials.TwilioAuthToken)
+                    || string.IsNullOrWhiteSpace(credentials.TwilioWhatsAppFrom)))
+            {
+                _logger.LogWarning("Skipping local credential mirror update because fetched credentials are incomplete.");
+                return;
+            }
+
+            Config.WhatsAppEnabled = credentials.Enabled;
+            Config.TwilioAccountSid = credentials.TwilioAccountSid;
+            Config.TwilioAuthToken = credentials.TwilioAuthToken;
+            Config.TwilioWhatsAppFrom = credentials.TwilioWhatsAppFrom;
+
+            if (!File.Exists(_configPath))
+            {
+                return;
+            }
+
+            var json = File.ReadAllText(_configPath);
+            var dict = JsonSerializer.Deserialize<Dictionary<string, object?>>(json)
+                ?? new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+
+            dict["whatsapp_enabled"] = credentials.Enabled;
+            dict["twilio_account_sid"] = credentials.TwilioAccountSid;
+            dict["twilio_auth_token"] = credentials.TwilioAuthToken;
+            dict["twilio_whatsapp_from"] = credentials.TwilioWhatsAppFrom;
+            dict["whatsapp_credentials_cached_version"] = credentials.Version;
+            dict["whatsapp_credentials_cached_at_utc"] = DateTime.UtcNow.ToString("O");
+
+            var output = JsonSerializer.Serialize(dict, new JsonSerializerOptions
+            {
+                WriteIndented = true,
+            });
+
+            File.WriteAllText(_configPath, output);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to persist fetched WhatsApp credentials to local config mirror.");
         }
     }
 }
