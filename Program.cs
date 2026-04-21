@@ -11,6 +11,9 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading.Channels;
 using Microsoft.Extensions.Options;
+using Twilio;
+using Twilio.Rest.Api.V2010.Account;
+using Twilio.Types;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -35,15 +38,15 @@ builder.WebHost.ConfigureKestrel(options =>
 
 builder.Services.Configure<AppPathsOptions>(options =>
 {
-    options.BasePath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "DocumentAgent");
+    options.BasePath = AgentEnvironmentPaths.GetAgentBasePath();
 });
 
 // Read laravel_origin from agent.config.json early (before DI builds) so CORS is
 // configured from the same file each laptop already has, with fallback to the
 // AGENT_ALLOWED_ORIGIN env var, then wildcard for development.
 var earlyConfigPath = Path.Combine(
-    Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
-    "DocumentAgent", "agent.config.json");
+    AgentEnvironmentPaths.GetAgentBasePath(),
+    "agent.config.json");
 
 string? laravelOriginFromFile = null;
 if (File.Exists(earlyConfigPath))
@@ -74,9 +77,11 @@ if (File.Exists(earlyConfigPath))
 
 builder.Services.Configure<SecurityOptions>(options =>
 {
-    options.AllowedOrigin = laravelOriginFromFile
+    var raw = laravelOriginFromFile
         ?? builder.Configuration["AGENT_ALLOWED_ORIGIN"]
         ?? "*";
+    // Origins never include a trailing slash; trim it so comparisons work.
+    options.AllowedOrigin = raw != "*" ? raw.TrimEnd('/') : raw;
 });
 
 builder.Services.AddHttpClient();
@@ -89,6 +94,10 @@ builder.Services.AddSingleton<ScanProfileStore>();
 builder.Services.AddSingleton<ScannerService>();
 builder.Services.AddSingleton<IUploadClient, HttpUploadClient>();
 builder.Services.AddHostedService<ScanJobProcessor>();
+builder.Services.AddSingleton<PersistentWhatsAppMessageStore>();
+builder.Services.AddSingleton<WhatsAppMessageQueue>();
+builder.Services.AddSingleton<IWhatsAppSender, TwilioWhatsAppSender>();
+builder.Services.AddHostedService<WhatsAppMessageProcessor>();
 builder.Services.AddHostedService<CleanupService>();
 
 var app = builder.Build();
@@ -104,7 +113,7 @@ app.MapGet("/health", (AppState state) => Results.Json(new
 
 app.MapGet("/port", () => Results.Json(new { port = selectedPort }));
 
-app.MapGet("/status", (AppState state, ScanJobQueue queue, ScannerService scannerService, AgentConfigProvider configProvider) =>
+app.MapGet("/status", (AppState state, ScanJobQueue queue, WhatsAppMessageQueue whatsappQueue, ScannerService scannerService, AgentConfigProvider configProvider) =>
 {
     var diskOk = SystemInfo.HasSufficientDiskSpace();
     var scannerOk = scannerService.HasAvailableScanner;
@@ -118,6 +127,8 @@ app.MapGet("/status", (AppState state, ScanJobQueue queue, ScannerService scanne
         last_scan_time = state.LastScanTimeUtc,
         queued_uploads_count = queue.CountQueuedUploads,
         failed_uploads_count = queue.CountFailedUploads,
+        queued_whatsapp_count = whatsappQueue.CountQueued,
+        failed_whatsapp_count = whatsappQueue.CountFailed,
         degraded,
         queued_jobs = queue.CountQueuedUploads,
         failed_jobs = queue.CountFailedUploads,
@@ -272,6 +283,48 @@ app.MapGet("/scan/{jobId}", (string jobId, ScanJobQueue queue) =>
     return Results.NotFound(new { error = "job_not_found" });
 });
 
+app.MapPost("/send-whatsapp", (WhatsAppRequest request, WhatsAppMessageQueue queue, ILoggerFactory loggerFactory) =>
+{
+    var logger = loggerFactory.CreateLogger("WhatsApp");
+
+    if (string.IsNullOrWhiteSpace(request.PhoneNumber) || string.IsNullOrWhiteSpace(request.Content))
+    {
+        return Results.Json(new { error = "missing_required_fields" }, statusCode: StatusCodes.Status400BadRequest);
+    }
+
+    var message = queue.Enqueue(request);
+    logger.LogInformation(
+        "WhatsApp job queued message_id={MessageId} notification_id={NotificationId} event_type={EventType}",
+        message.MessageId,
+        message.NotificationId,
+        message.EventType ?? "(unknown)");
+
+    return Results.Accepted($"/whatsapp/{message.MessageId}", new
+    {
+        message_id = message.MessageId,
+        status = message.Status.ToString().ToLowerInvariant(),
+    });
+});
+
+app.MapGet("/whatsapp/{messageId}", (string messageId, WhatsAppMessageQueue queue) =>
+{
+    if (queue.TryGet(messageId, out var message))
+    {
+        return Results.Json(new
+        {
+            message_id = message.MessageId,
+            notification_id = message.NotificationId,
+            status = message.Status.ToString().ToLowerInvariant(),
+            provider_message_sid = message.ProviderMessageSid,
+            error_message = message.ErrorMessage,
+            error_code = message.ErrorCode,
+            updated_at = message.UpdatedUtc,
+        });
+    }
+
+    return Results.NotFound(new { error = "message_not_found" });
+});
+
 app.Run();
 
 internal record ScanRequest
@@ -284,6 +337,49 @@ internal record ScanRequest
 
     [JsonPropertyName("client_request_id")]
     public string? ClientRequestId { get; init; }
+}
+
+internal record WhatsAppRequest
+{
+    [JsonPropertyName("notification_id")]
+    public long? NotificationId { get; init; }
+
+    [JsonPropertyName("event_type")]
+    public string? EventType { get; init; }
+
+    [JsonPropertyName("phone_number")]
+    public string? PhoneNumber { get; init; }
+
+    [JsonPropertyName("content")]
+    public string? Content { get; init; }
+
+    [JsonPropertyName("callback_url")]
+    public string? CallbackUrl { get; init; }
+}
+
+internal enum WhatsAppMessageStatus
+{
+    Queued,
+    Sending,
+    Delivered,
+    Failed
+}
+
+internal sealed class WhatsAppMessage
+{
+    public string MessageId { get; set; } = string.Empty;
+    public long? NotificationId { get; set; }
+    public string? EventType { get; set; }
+    public string PhoneNumber { get; set; } = string.Empty;
+    public string Content { get; set; } = string.Empty;
+    public string? CallbackUrl { get; set; }
+    public WhatsAppMessageStatus Status { get; set; } = WhatsAppMessageStatus.Queued;
+    public string? ProviderMessageSid { get; set; }
+    public string? ErrorCode { get; set; }
+    public string? ErrorMessage { get; set; }
+    public DateTime CreatedUtc { get; set; } = DateTime.UtcNow;
+    public DateTime UpdatedUtc { get; set; } = DateTime.UtcNow;
+    public int Attempts { get; set; }
 }
 
 internal sealed class ProfileRequest
@@ -414,6 +510,230 @@ internal sealed class ScanJobQueue
     {
         job.UpdatedUtc = DateTime.UtcNow;
         _store.Save(job);
+    }
+}
+
+internal sealed class WhatsAppMessageQueue
+{
+    private readonly ConcurrentDictionary<string, WhatsAppMessage> _messages = new();
+    private readonly Channel<WhatsAppMessage> _channel = Channel.CreateUnbounded<WhatsAppMessage>();
+    private readonly PersistentWhatsAppMessageStore _store;
+
+    public WhatsAppMessageQueue(PersistentWhatsAppMessageStore store)
+    {
+        _store = store;
+
+        foreach (var message in _store.LoadPending())
+        {
+            _messages.TryAdd(message.MessageId, message);
+            _channel.Writer.TryWrite(message);
+        }
+    }
+
+    public int CountQueued => _messages.Values.Count(m => m.Status is WhatsAppMessageStatus.Queued or WhatsAppMessageStatus.Sending);
+
+    public int CountFailed => _messages.Values.Count(m => m.Status == WhatsAppMessageStatus.Failed);
+
+    public WhatsAppMessage Enqueue(WhatsAppRequest request)
+    {
+        var message = new WhatsAppMessage
+        {
+            MessageId = Guid.NewGuid().ToString("N"),
+            NotificationId = request.NotificationId,
+            EventType = request.EventType,
+            PhoneNumber = request.PhoneNumber!.Trim(),
+            Content = request.Content!.Trim(),
+            CallbackUrl = string.IsNullOrWhiteSpace(request.CallbackUrl) ? null : request.CallbackUrl.Trim(),
+            Status = WhatsAppMessageStatus.Queued,
+        };
+
+        _messages.TryAdd(message.MessageId, message);
+        _store.Save(message);
+        _channel.Writer.TryWrite(message);
+        return message;
+    }
+
+    public IAsyncEnumerable<WhatsAppMessage> ReadAllAsync(CancellationToken token) => _channel.Reader.ReadAllAsync(token);
+
+    public bool TryGet(string messageId, out WhatsAppMessage message) => _messages.TryGetValue(messageId, out message!);
+
+    public void Update(WhatsAppMessage message)
+    {
+        message.UpdatedUtc = DateTime.UtcNow;
+        _store.Save(message);
+    }
+}
+
+internal interface IWhatsAppSender
+{
+    Task<string> SendAsync(WhatsAppMessage message, CancellationToken cancellationToken);
+}
+
+internal sealed class TwilioWhatsAppSender : IWhatsAppSender
+{
+    private readonly AgentConfigProvider _config;
+
+    public TwilioWhatsAppSender(AgentConfigProvider config)
+    {
+        _config = config;
+    }
+
+    public async Task<string> SendAsync(WhatsAppMessage message, CancellationToken cancellationToken)
+    {
+        if (!_config.Config.WhatsAppEnabled)
+        {
+            throw new InvalidOperationException("whatsapp_disabled");
+        }
+
+        if (string.IsNullOrWhiteSpace(_config.Config.TwilioAccountSid)
+            || string.IsNullOrWhiteSpace(_config.Config.TwilioAuthToken)
+            || string.IsNullOrWhiteSpace(_config.Config.TwilioWhatsAppFrom))
+        {
+            throw new InvalidOperationException("twilio_not_configured");
+        }
+
+        var to = NormalizeWhatsAppAddress(message.PhoneNumber);
+        var from = NormalizeWhatsAppAddress(_config.Config.TwilioWhatsAppFrom);
+
+        TwilioClient.Init(_config.Config.TwilioAccountSid, _config.Config.TwilioAuthToken);
+
+        var created = await MessageResource.CreateAsync(
+            to: new PhoneNumber(to),
+            from: new PhoneNumber(from),
+            body: message.Content);
+
+        return created.Sid;
+    }
+
+    private static string NormalizeWhatsAppAddress(string value)
+    {
+        var trimmed = value.Trim();
+        if (trimmed.StartsWith("whatsapp:", StringComparison.OrdinalIgnoreCase))
+        {
+            return "whatsapp:" + trimmed[9..].Trim();
+        }
+
+        return "whatsapp:" + trimmed;
+    }
+}
+
+internal sealed class WhatsAppMessageProcessor : BackgroundService
+{
+    private readonly WhatsAppMessageQueue _queue;
+    private readonly IWhatsAppSender _sender;
+    private readonly AgentConfigProvider _config;
+    private readonly IHttpClientFactory _factory;
+    private readonly ILogger<WhatsAppMessageProcessor> _logger;
+
+    public WhatsAppMessageProcessor(WhatsAppMessageQueue queue, IWhatsAppSender sender, AgentConfigProvider config, IHttpClientFactory factory, ILogger<WhatsAppMessageProcessor> logger)
+    {
+        _queue = queue;
+        _sender = sender;
+        _config = config;
+        _factory = factory;
+        _logger = logger;
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        await foreach (var message in _queue.ReadAllAsync(stoppingToken))
+        {
+            var maxAttempts = Math.Max(1, _config.Config.WhatsAppMaxRetries);
+            while (!stoppingToken.IsCancellationRequested && message.Attempts < maxAttempts)
+            {
+                try
+                {
+                    message.Status = WhatsAppMessageStatus.Sending;
+                    message.Attempts += 1;
+                    _queue.Update(message);
+
+                    await SendCallbackAsync(message, "sending", null, null, stoppingToken);
+
+                    var sid = await _sender.SendAsync(message, stoppingToken);
+                    message.ProviderMessageSid = sid;
+                    message.Status = WhatsAppMessageStatus.Delivered;
+                    message.ErrorCode = null;
+                    message.ErrorMessage = null;
+                    _queue.Update(message);
+
+                    await SendCallbackAsync(message, "delivered", null, null, stoppingToken);
+                    _logger.LogInformation("WhatsApp message delivered message_id={MessageId} sid={Sid}", message.MessageId, sid);
+                    break;
+                }
+                catch (Exception ex) when (message.Attempts < maxAttempts)
+                {
+                    message.ErrorCode = "send_failed_retryable";
+                    message.ErrorMessage = ex.Message;
+                    _queue.Update(message);
+
+                    _logger.LogWarning(ex, "WhatsApp send failed message_id={MessageId} attempt={Attempt}", message.MessageId, message.Attempts);
+                    var delaySeconds = Math.Min(Math.Pow(2, message.Attempts), 30);
+                    await Task.Delay(TimeSpan.FromSeconds(delaySeconds), stoppingToken);
+                }
+                catch (Exception ex)
+                {
+                    message.Status = WhatsAppMessageStatus.Failed;
+                    message.ErrorCode = "send_failed";
+                    message.ErrorMessage = ex.Message;
+                    _queue.Update(message);
+
+                    await SendCallbackAsync(message, "failed", "send_failed", ex.Message, stoppingToken);
+                    _logger.LogError(ex, "WhatsApp message failed permanently message_id={MessageId}", message.MessageId);
+                    break;
+                }
+            }
+        }
+    }
+
+    private async Task SendCallbackAsync(WhatsAppMessage message, string status, string? errorCode, string? errorMessage, CancellationToken cancellationToken)
+    {
+        var callbackUrl = message.CallbackUrl;
+        if (string.IsNullOrWhiteSpace(callbackUrl) || message.NotificationId is null)
+        {
+            return;
+        }
+
+        try
+        {
+            var payload = new Dictionary<string, object?>
+            {
+                ["notification_id"] = message.NotificationId,
+                ["status"] = status,
+                ["machine_uuid"] = Environment.MachineName,
+                ["provider_message_sid"] = message.ProviderMessageSid,
+                ["error_code"] = errorCode,
+                ["error_message"] = errorMessage,
+                ["response_payload"] = new Dictionary<string, object?>
+                {
+                    ["message_id"] = message.MessageId,
+                    ["attempts"] = message.Attempts,
+                    ["event_type"] = message.EventType,
+                },
+            };
+
+            var client = _factory.CreateClient();
+            client.Timeout = TimeSpan.FromSeconds(Math.Max(5, _config.Config.WhatsAppTimeoutSeconds));
+
+            using var request = new HttpRequestMessage(HttpMethod.Post, callbackUrl)
+            {
+                Content = JsonContent.Create(payload)
+            };
+
+            if (!string.IsNullOrWhiteSpace(_config.Config.AgentToken))
+            {
+                request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", _config.Config.AgentToken);
+            }
+
+            using var response = await client.SendAsync(request, cancellationToken);
+            if (!response.IsSuccessStatusCode)
+            {
+                _logger.LogWarning("WhatsApp callback returned status {Status} for message {MessageId}", (int) response.StatusCode, message.MessageId);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "WhatsApp callback failed message_id={MessageId}", message.MessageId);
+        }
     }
 }
 
@@ -1017,6 +1337,24 @@ internal sealed class AgentConfig
 
     [JsonPropertyName("laravel_origin")]
     public string? LaravelOrigin { get; set; }
+
+    [JsonPropertyName("whatsapp_enabled")]
+    public bool WhatsAppEnabled { get; set; } = false;
+
+    [JsonPropertyName("twilio_account_sid")]
+    public string? TwilioAccountSid { get; set; }
+
+    [JsonPropertyName("twilio_auth_token")]
+    public string? TwilioAuthToken { get; set; }
+
+    [JsonPropertyName("twilio_whatsapp_from")]
+    public string? TwilioWhatsAppFrom { get; set; }
+
+    [JsonPropertyName("whatsapp_max_retries")]
+    public int WhatsAppMaxRetries { get; set; } = 5;
+
+    [JsonPropertyName("whatsapp_timeout_seconds")]
+    public int WhatsAppTimeoutSeconds { get; set; } = 30;
 }
 
 internal sealed class AgentConfigProvider
@@ -1054,6 +1392,12 @@ internal sealed class AgentConfigProvider
                 Config.Naps2Path = StripInvisibleChars(Config.Naps2Path);
             if (Config.UploadUrl is not null)
                 Config.UploadUrl = StripInvisibleChars(Config.UploadUrl);
+            if (Config.TwilioAccountSid is not null)
+                Config.TwilioAccountSid = StripInvisibleChars(Config.TwilioAccountSid);
+            if (Config.TwilioAuthToken is not null)
+                Config.TwilioAuthToken = StripInvisibleChars(Config.TwilioAuthToken);
+            if (Config.TwilioWhatsAppFrom is not null)
+                Config.TwilioWhatsAppFrom = StripInvisibleChars(Config.TwilioWhatsAppFrom);
 
             return Config;
         }
@@ -1144,7 +1488,7 @@ internal sealed class AppState
 
     public bool PrinterConnected { get; set; }
 
-    public string BasePathRoot { get; set; } = Path.GetPathRoot(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments)) ?? string.Empty;
+    public string BasePathRoot { get; set; } = AgentEnvironmentPaths.GetDiskRoot();
 
     public double UptimeSeconds => (DateTime.UtcNow - StartTimeUtc).TotalSeconds;
 
@@ -1243,6 +1587,60 @@ internal sealed class PersistentJobStore
         Directory.CreateDirectory(dir);
         var path = Path.Combine(dir, job.JobId + ".json");
         var json = JsonSerializer.Serialize(job, _jsonOptions);
+        File.WriteAllText(path, json);
+    }
+}
+
+internal sealed class PersistentWhatsAppMessageStore
+{
+    private readonly AppPaths _paths;
+    private readonly JsonSerializerOptions _jsonOptions = new(JsonSerializerDefaults.Web)
+    {
+        WriteIndented = false
+    };
+
+    public PersistentWhatsAppMessageStore(AppPaths paths)
+    {
+        _paths = paths;
+        Directory.CreateDirectory(Path.Combine(_paths.Queue, "whatsapp"));
+    }
+
+    public IEnumerable<WhatsAppMessage> LoadPending()
+    {
+        var dir = Path.Combine(_paths.Queue, "whatsapp");
+        foreach (var file in Directory.GetFiles(dir, "*.json"))
+        {
+            WhatsAppMessage? message = null;
+            try
+            {
+                message = JsonSerializer.Deserialize<WhatsAppMessage>(File.ReadAllText(file), _jsonOptions);
+            }
+            catch
+            {
+                // Ignore corrupt files.
+            }
+
+            if (message is null)
+            {
+                continue;
+            }
+
+            if (message.Status is WhatsAppMessageStatus.Delivered or WhatsAppMessageStatus.Failed)
+            {
+                continue;
+            }
+
+            message.Status = WhatsAppMessageStatus.Queued;
+            yield return message;
+        }
+    }
+
+    public void Save(WhatsAppMessage message)
+    {
+        var dir = Path.Combine(_paths.Queue, "whatsapp");
+        Directory.CreateDirectory(dir);
+        var path = Path.Combine(dir, message.MessageId + ".json");
+        var json = JsonSerializer.Serialize(message, _jsonOptions);
         File.WriteAllText(path, json);
     }
 }
@@ -1835,7 +2233,7 @@ internal sealed class FileJsonLogger : ILogger
     {
         lock (_sync)
         {
-            var basePath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "DocumentAgent", "logs");
+            var basePath = Path.Combine(AgentEnvironmentPaths.GetAgentBasePath(), "logs");
             Directory.CreateDirectory(basePath);
             var path = Path.Combine(basePath, DateTime.UtcNow.ToString("yyyy-MM-dd") + ".log");
             File.AppendAllText(path, line + Environment.NewLine);
@@ -1930,10 +2328,41 @@ internal sealed class CleanupService : BackgroundService
             }
         }
 
-        // 4. Remove old cache/completed files (PDFs already uploaded)
+        // 4. Remove old delivered/failed WhatsApp queue JSON files
+        var whatsappDir = Path.Combine(_paths.Queue, "whatsapp");
+        if (Directory.Exists(whatsappDir))
+        {
+            foreach (var file in Directory.GetFiles(whatsappDir, "*.json"))
+            {
+                try
+                {
+                    var json = File.ReadAllText(file);
+                    using var doc = JsonDocument.Parse(json);
+                    var root = doc.RootElement;
+
+                    var statusStr = root.TryGetProperty("Status", out var s) ? s.GetString() : null;
+                    var isTerminal = statusStr is "Delivered" or "Failed";
+                    if (!isTerminal) continue;
+
+                    var age = DateTime.UtcNow - File.GetLastWriteTimeUtc(file);
+                    var threshold = statusStr == "Failed" ? KeepFailed : KeepCompleted;
+                    if (age > threshold)
+                    {
+                        File.Delete(file);
+                        deleted++;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Could not process WhatsApp queue file {File} during cleanup", file);
+                }
+            }
+        }
+
+        // 5. Remove old cache/completed files (PDFs already uploaded)
         deleted += WipeOldFiles(Path.Combine(_paths.Cache, "completed"), KeepCompleted);
 
-        // 5. Remove old failed/ files
+        // 6. Remove old failed/ files
         deleted += WipeOldFiles(_paths.Failed, KeepFailed);
 
         if (deleted > 0)
@@ -2037,7 +2466,7 @@ internal static class SystemInfo
 
     public static bool HasSufficientDiskSpace(long thresholdBytes = OneGb)
     {
-        var free = GetFreeDiskSpaceBytes(Path.GetPathRoot(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments)) ?? string.Empty);
+        var free = GetFreeDiskSpaceBytes(AgentEnvironmentPaths.GetDiskRoot());
         return free >= thresholdBytes;
     }
 
@@ -2075,5 +2504,55 @@ internal static class SystemInfo
         {
             return 0;
         }
+    }
+}
+
+internal static class AgentEnvironmentPaths
+{
+    public static string GetAgentBasePath() => Path.Combine(GetDocumentsDirectory(), "DocumentAgent");
+
+    public static string GetDiskRoot()
+    {
+        var documentsDirectory = GetDocumentsDirectory();
+        return Path.GetPathRoot(documentsDirectory) ?? documentsDirectory;
+    }
+
+    private static string GetDocumentsDirectory()
+    {
+        // On Windows this reliably returns e.g. C:\Users\username\Documents.
+        // On macOS it can return empty string when the app isn't launched from a
+        // standard user session, so we fall back to HOME-based resolution.
+        var documents = NormalizeAbsolute(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments));
+        if (documents is not null)
+        {
+            return documents;
+        }
+
+        // Fallback: derive from UserProfile or HOME env var
+        var userProfile = NormalizeAbsolute(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile))
+            ?? NormalizeAbsolute(Environment.GetEnvironmentVariable("HOME"));
+        if (userProfile is not null)
+        {
+            return Path.Combine(userProfile, "Documents");
+        }
+
+        // Last resort — keep data next to the binary
+        return Path.Combine(AppContext.BaseDirectory, "DocumentAgentHome");
+    }
+
+    private static string? NormalizeAbsolute(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return null;
+        }
+
+        var trimmed = path.Trim();
+        if (!Path.IsPathRooted(trimmed))
+        {
+            return null;
+        }
+
+        return Path.GetFullPath(trimmed);
     }
 }

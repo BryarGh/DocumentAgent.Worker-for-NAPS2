@@ -31,7 +31,13 @@ Agent data directories are under `~/Documents/DocumentAgent` by default (config,
   "naps2_path": "/Applications/NAPS2.app/Contents/MacOS/NAPS2",
   "upload_url": "https://your-app.test/api/document-agent/upload",
   "agent_token": "YOUR_TOKEN",
-  "laravel_origin": "http://192.168.33.50"
+  "laravel_origin": "http://192.168.33.50",
+  "whatsapp_enabled": true,
+  "twilio_account_sid": "ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "twilio_auth_token": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "twilio_whatsapp_from": "whatsapp:+14155238886",
+  "whatsapp_max_retries": 5,
+  "whatsapp_timeout_seconds": 30
 }
 ```
 
@@ -42,7 +48,13 @@ Agent data directories are under `~/Documents/DocumentAgent` by default (config,
   "naps2_path": "C:\\Program Files\\NAPS2\\naps2.console.exe",
   "upload_url": "https://your-app.test/api/document-agent/upload",
   "agent_token": "YOUR_TOKEN",
-  "laravel_origin": "http://192.168.33.50"
+  "laravel_origin": "http://192.168.33.50",
+  "whatsapp_enabled": true,
+  "twilio_account_sid": "ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "twilio_auth_token": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "twilio_whatsapp_from": "whatsapp:+14155238886",
+  "whatsapp_max_retries": 5,
+  "whatsapp_timeout_seconds": 30
 }
 ```
 
@@ -68,6 +80,8 @@ The agent sends `Access-Control-Allow-Origin` headers on every response and hand
 - `POST /profiles` → body `{ profile_name, scanner_name, dpi, color_mode, source, duplex, paper_size }`
 - `POST /scan` → body `{ document_id, profile_name, client_request_id? }`; returns 202 `{ job_id, status, deduped? }`
 - `GET /scan/{jobId}` → `{ job_id, status, error_message? }`
+- `POST /send-whatsapp` → body `{ notification_id?, event_type?, phone_number, content, callback_url? }`; returns 202 `{ message_id, status }`
+- `GET /whatsapp/{messageId}` → `{ message_id, status, provider_message_sid?, error_message?, error_code? }`
 
 Errors include `scanner_unavailable`, `profile_not_found`, `upload_url_missing`, `scan_timeout`, `scan_failed`, `insufficient_disk_space`.
 

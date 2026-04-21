@@ -10,5 +10,6 @@
   <ItemGroup>
     <!-- Enables running as a Windows Service (no-op on macOS/Linux) -->
     <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="8.0.0" />
+    <PackageReference Include="Twilio" Version="7.3.0" />
   </ItemGroup>
 </Project>
