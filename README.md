@@ -36,9 +36,6 @@ Agent data directories are under `~/Documents/DocumentAgent` by default (config,
   "whatsapp_credentials_source": "igms_with_fallback",
   "whatsapp_credentials_url": "https://your-app.test/api/document-agent/whatsapp/credentials",
   "whatsapp_credentials_ttl_seconds": 900,
-  "twilio_account_sid": "ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-  "twilio_auth_token": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-  "twilio_whatsapp_from": "whatsapp:+14155238886",
   "whatsapp_max_retries": 5,
   "whatsapp_timeout_seconds": 30
 }
@@ -56,11 +53,18 @@ Agent data directories are under `~/Documents/DocumentAgent` by default (config,
   "whatsapp_credentials_source": "igms_with_fallback",
   "whatsapp_credentials_url": "https://your-app.test/api/document-agent/whatsapp/credentials",
   "whatsapp_credentials_ttl_seconds": 900,
-  "twilio_account_sid": "ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-  "twilio_auth_token": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-  "twilio_whatsapp_from": "whatsapp:+14155238886",
   "whatsapp_max_retries": 5,
   "whatsapp_timeout_seconds": 30
+}
+```
+
+Optional local fallback keys (only for `igms_with_fallback` transition mode):
+
+```json
+{
+  "twilio_account_sid": "ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "twilio_auth_token": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "twilio_whatsapp_from": "whatsapp:+14155238886"
 }
 ```
 
@@ -78,6 +82,7 @@ The worker supports centralized Twilio credentials from IGMS Settings with safe 
   - Fetches credentials from `whatsapp_credentials_url` using `agent_token` bearer auth.
   - Caches credentials in memory for `whatsapp_credentials_ttl_seconds`.
   - Falls back to local JSON credentials if IGMS is temporarily unreachable.
+  - Local Twilio keys are optional and should be removed after confidence period if policy requires centralized-only secrets.
 - `whatsapp_credentials_source: "igms"`
   - Uses IGMS credentials only, with no local fallback.
 
