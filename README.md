@@ -195,8 +195,11 @@ Publish only:
 - Yes.
 - In startup task mode on Windows, the agent now shows a tray icon near the clock.
 - The tray menu lets the user:
+  - see live health/scanner/queue state
   - open the status page
   - open the logs folder
+  - open the latest log file (tail view in Notepad)
+  - open the config file
   - restart the agent
   - exit the agent
 
