@@ -140,6 +140,120 @@ curl http://127.0.0.1:3333/scan/<job_id>
 
 Follow these steps on Windows machines to install and run the agent reliably, and use the troubleshooting tips when something fails.
 
+### Recommended runtime mode for scanner stability
+
+- You do **not** need to remove `install-service.ps1`.
+- The installer now supports **both** modes:
+  - default: Windows Service
+  - optional: Startup Task at user logon via `-StartupTask`
+- Reason: many TWAIN/WIA drivers require an interactive desktop session and can fail in Session 0 service context.
+
+Install as a Windows Service:
+
+```powershell
+.\install-service.ps1
+```
+
+Install as a Startup Task (preferred for TWAIN/WIA scanners):
+
+```powershell
+.\install-service.ps1 -StartupTask
+```
+
+Publish only:
+
+```powershell
+.\install-service.ps1 -Publish
+```
+
+- Remove Service install:
+
+```powershell
+.\install-service.ps1 -Uninstall
+```
+
+- Remove Startup Task install:
+
+```powershell
+.\install-service.ps1 -StartupTask -Uninstall
+```
+
+### What is the difference?
+
+- **Service mode** starts at Windows boot, even before user logon. Good for server-style always-on behavior.
+- **Startup task mode** starts when the target user logs into Windows. Good for desktop scanners that need an interactive session.
+- If manual EXE run works but service mode fails, startup task mode is the right choice.
+
+### Will startup task mode start automatically?
+
+- Yes. It starts automatically at that user's Windows logon.
+- The installer also starts it immediately once, so you do not need to log out and back in after installation.
+
+### How do I debug it later?
+
+- For both modes:
+
+```powershell
+curl http://127.0.0.1:3333/health
+curl http://127.0.0.1:3333/scanners
+```
+
+- Logs are still here in both modes:
+
+```powershell
+$env:USERPROFILE\Documents\DocumentAgent\logs
+```
+
+- Debug service mode:
+
+```powershell
+Get-Service DocumentAgent
+sc.exe qc DocumentAgent
+sc.exe queryex DocumentAgent
+```
+
+- Debug startup task mode:
+
+```powershell
+Get-ScheduledTask -TaskName "DocumentAgent-Startup"
+Get-ScheduledTaskInfo -TaskName "DocumentAgent-Startup"
+```
+
+- If you want foreground debugging, run the EXE manually again from a normal logged-in session.
+
+### How do I stop or turn it off temporarily?
+
+- Stop service mode now:
+
+```powershell
+Stop-Service DocumentAgent
+```
+
+- Disable service mode from starting automatically:
+
+```powershell
+Set-Service DocumentAgent -StartupType Disabled
+```
+
+- Stop startup task mode now:
+
+```powershell
+Stop-Process -Name DocumentAgent.Worker -ErrorAction SilentlyContinue
+```
+
+- Disable startup task mode without uninstalling:
+
+```powershell
+Disable-ScheduledTask -TaskName "DocumentAgent-Startup"
+```
+
+- Re-enable startup task mode:
+
+```powershell
+Enable-ScheduledTask -TaskName "DocumentAgent-Startup"
+Start-ScheduledTask -TaskName "DocumentAgent-Startup"
+```
+
 - Publish for distribution (developer machine):
 
 ```powershell

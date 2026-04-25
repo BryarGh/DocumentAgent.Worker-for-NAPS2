@@ -867,6 +867,8 @@ internal sealed class ScanJobProcessor : BackgroundService
 
         if (shouldFallbackToDevice)
         {
+            string? lastDeviceFailureReason = null;
+
             if (IsImmediateDeviceFailure(profileResult.Stdout, profileResult.Stderr))
             {
                 _logger.LogWarning(
@@ -918,6 +920,12 @@ internal sealed class ScanJobProcessor : BackgroundService
                     return;
                 }
 
+                var deviceReason = DiagnosticLogHelper.ExtractPrimaryFailureReason(deviceResult.Stdout, deviceResult.Stderr);
+                if (!string.IsNullOrWhiteSpace(deviceReason))
+                {
+                    lastDeviceFailureReason = deviceReason;
+                }
+
                 if (IsImmediateDeviceFailure(deviceResult.Stdout, deviceResult.Stderr))
                 {
                     _logger.LogWarning(
@@ -936,7 +944,9 @@ internal sealed class ScanJobProcessor : BackgroundService
                 job.Profile.ScannerName,
                 string.Join(",", attemptedDrivers));
 
-            var reason = DiagnosticLogHelper.ExtractPrimaryFailureReason(profileResult.Stdout, profileResult.Stderr);
+            var reason = !string.IsNullOrWhiteSpace(lastDeviceFailureReason)
+                ? lastDeviceFailureReason
+                : DiagnosticLogHelper.ExtractPrimaryFailureReason(profileResult.Stdout, profileResult.Stderr);
             job.LastAttemptKind = "device-fallback";
             job.LastAttemptMessage = $"All fallback attempts failed ({string.Join(",", attemptedDrivers)})";
             job.ErrorMessage = string.IsNullOrWhiteSpace(reason)
@@ -990,7 +1000,14 @@ internal sealed class ScanJobProcessor : BackgroundService
     {
         var text = (stdout + "\n" + stderr).ToLowerInvariant();
         return text.Contains("paper jam")
-            || text.Contains("cover open");
+            || text.Contains("cover open")
+            || text.Contains("scanner is offline")
+            || text.Contains("selected scanner is offline")
+            || text.Contains("selected scanner could not be found")
+            || text.Contains("device not found")
+            || text.Contains("scanner not found")
+            || text.Contains("no scanner")
+            || text.Contains("no device");
     }
 
     private static bool ShouldAttemptDeviceFallback(string stdout, string stderr)
