@@ -118,7 +118,7 @@ function Show-ServiceDiagnostics {
         } else {
             $sysEvents | ForEach-Object {
                 Write-Host "  [$($_.TimeCreated)] Id=$($_.Id) Level=$($_.LevelDisplayName)"
-                Write-Host "  $($_.Message -replace \"`r`n\", ' ')"
+                Write-Host "  $($_.Message -replace "`r`n", ' ')"
             }
         }
     } catch {
@@ -136,7 +136,7 @@ function Show-ServiceDiagnostics {
         } else {
             $appEvents | ForEach-Object {
                 Write-Host "  [$($_.TimeCreated)] Provider=$($_.ProviderName) Id=$($_.Id) Level=$($_.LevelDisplayName)"
-                Write-Host "  $($_.Message -replace \"`r`n\", ' ')"
+                Write-Host "  $($_.Message -replace "`r`n", ' ')"
             }
         }
     } catch {
@@ -203,7 +203,7 @@ function Show-StartupTaskDiagnostics {
         } else {
             $taskEvents | ForEach-Object {
                 Write-Host "  [$($_.TimeCreated)] Id=$($_.Id) Level=$($_.LevelDisplayName)"
-                Write-Host "  $($_.Message -replace \"`r`n\", ' ')"
+                Write-Host "  $($_.Message -replace "`r`n", ' ')"
             }
         }
     } catch {
