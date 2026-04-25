@@ -241,6 +241,16 @@ dir "$env:USERPROFILE\Documents\DocumentAgent\logs" | sort LastWriteTime -Descen
 curl http://127.0.0.1:3333/scanners
 ```
 
+- Built-in diagnostics on service start failure (recommended)
+  - If `install-service.ps1` fails to start the service (for example error `1053`), it now prints a diagnostics block automatically, including:
+  - `sc qc` (binary path and startup config)
+  - `sc queryex` (runtime state / exit info)
+  - Service registry `Environment` values (including `DOCUMENTAGENT_BASE_PATH`)
+  - Executable metadata (exists/size/last write/SHA256)
+  - Recent Service Control Manager + Application Event Log entries
+  - Tail of the latest agent log file
+  - When opening an issue, paste the entire `========= DocumentAgent Diagnostics =========` block. That usually gives enough evidence to identify root cause in one pass.
+
 - agent.config.json notes
   - Path examples for Windows must escape backslashes or use forward slashes. Example valid JSON value:
 

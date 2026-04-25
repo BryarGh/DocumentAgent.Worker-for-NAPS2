@@ -28,6 +28,111 @@ $ServiceName    = "DocumentAgent"
 $ServiceDisplay = "Document Agent (NAPS2 Scanner)"
 $ServiceDesc    = "Loopback scanning agent that drives NAPS2 and uploads scanned PDFs to your Laravel server."
 
+function Show-ServiceDiagnostics {
+    param(
+        [string]$Name,
+        [string]$ExePath,
+        [string]$AgentBasePath
+    )
+
+    Write-Host ""
+    Write-Host "========= DocumentAgent Diagnostics =========" -ForegroundColor Yellow
+
+    Write-Host "[A] Service config (sc qc):" -ForegroundColor Cyan
+    cmd /c "sc.exe qc $Name"
+
+    Write-Host ""
+    Write-Host "[B] Service runtime state (sc queryex):" -ForegroundColor Cyan
+    cmd /c "sc.exe queryex $Name"
+
+    Write-Host ""
+    Write-Host "[C] Service registry Environment block:" -ForegroundColor Cyan
+    try {
+        $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$Name"
+        $envBlock = (Get-ItemProperty -Path $regPath -Name "Environment" -ErrorAction Stop).Environment
+        if ($null -eq $envBlock -or $envBlock.Count -eq 0) {
+            Write-Host "(empty)"
+        } else {
+            $envBlock | ForEach-Object { Write-Host "  $_" }
+        }
+    } catch {
+        Write-Host "Unable to read Environment registry value: $_" -ForegroundColor Yellow
+    }
+
+    Write-Host ""
+    Write-Host "[D] Exe path + file metadata:" -ForegroundColor Cyan
+    Write-Host "  ExePath: $ExePath"
+    if (Test-Path $ExePath) {
+        try {
+            $item = Get-Item $ExePath
+            $hash = Get-FileHash -Path $ExePath -Algorithm SHA256
+            Write-Host "  Exists: true"
+            Write-Host "  Size: $($item.Length) bytes"
+            Write-Host "  LastWrite: $($item.LastWriteTime)"
+            Write-Host "  SHA256: $($hash.Hash)"
+        } catch {
+            Write-Host "  Exists: true (metadata read failed: $_)" -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host "  Exists: false" -ForegroundColor Red
+    }
+
+    Write-Host ""
+    Write-Host "[E] Recent Service Control Manager events (System log):" -ForegroundColor Cyan
+    try {
+        $sysEvents = Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Service Control Manager'; StartTime = (Get-Date).AddMinutes(-30) } -ErrorAction Stop |
+            Where-Object { $_.Message -match $Name } |
+            Select-Object -First 8 TimeCreated, Id, LevelDisplayName, Message
+        if ($null -eq $sysEvents -or $sysEvents.Count -eq 0) {
+            Write-Host "  No recent matching events in the last 30 minutes."
+        } else {
+            $sysEvents | ForEach-Object {
+                Write-Host "  [$($_.TimeCreated)] Id=$($_.Id) Level=$($_.LevelDisplayName)"
+                Write-Host "  $($_.Message -replace "`r`n", ' ')"
+            }
+        }
+    } catch {
+        Write-Host "  Could not query System events: $_" -ForegroundColor Yellow
+    }
+
+    Write-Host ""
+    Write-Host "[F] Recent DocumentAgent events (Application log):" -ForegroundColor Cyan
+    try {
+        $appEvents = Get-WinEvent -FilterHashtable @{ LogName = 'Application'; StartTime = (Get-Date).AddMinutes(-30) } -ErrorAction Stop |
+            Where-Object { $_.Message -match 'DocumentAgent|DocumentAgent.Worker' } |
+            Select-Object -First 8 TimeCreated, ProviderName, Id, LevelDisplayName, Message
+        if ($null -eq $appEvents -or $appEvents.Count -eq 0) {
+            Write-Host "  No recent matching application events in the last 30 minutes."
+        } else {
+            $appEvents | ForEach-Object {
+                Write-Host "  [$($_.TimeCreated)] Provider=$($_.ProviderName) Id=$($_.Id) Level=$($_.LevelDisplayName)"
+                Write-Host "  $($_.Message -replace "`r`n", ' ')"
+            }
+        }
+    } catch {
+        Write-Host "  Could not query Application events: $_" -ForegroundColor Yellow
+    }
+
+    Write-Host ""
+    Write-Host "[G] Latest agent log tail:" -ForegroundColor Cyan
+    $logDir = Join-Path $AgentBasePath "logs"
+    if (Test-Path $logDir) {
+        $latestLog = Get-ChildItem -Path $logDir -File -Filter "*.log" -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+        if ($null -ne $latestLog) {
+            Write-Host "  Log file: $($latestLog.FullName)"
+            Get-Content -Path $latestLog.FullName -Tail 40 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $_" }
+        } else {
+            Write-Host "  No .log files found in: $logDir"
+        }
+    } else {
+        Write-Host "  Log directory not found: $logDir"
+    }
+
+    Write-Host "=============================================" -ForegroundColor Yellow
+}
+
 # -- Require Administrator ----------------------------------------------------
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
         [Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -54,12 +159,7 @@ $CsprojPath   = Join-Path $PSScriptRoot "DocumentAgent.Worker.csproj"
 $PublishDir   = Join-Path $PSScriptRoot "publish"
 $ExePublished = Join-Path $PublishDir "DocumentAgent.Worker.exe"
 
-if (Test-Path $ExeNextToScript) {
-    # -- End-user mode: exe already here, install directly -------------------
-    $ExePath = $ExeNextToScript
-    Write-Host "[1/6] Install mode: end-user (exe next to script)" -ForegroundColor Cyan
-
-} elseif (Test-Path $CsprojPath) {
+if (Test-Path $CsprojPath) {
     # -- Developer mode: publish from source ---------------------------------
     Write-Host "[1/6] Install mode: developer (building from source)" -ForegroundColor Cyan
     Write-Host "       Publish-only: $PublishRequested"
@@ -91,6 +191,14 @@ if (Test-Path $ExeNextToScript) {
         Write-Host "Copy DocumentAgent.Worker.exe and install-service.ps1 to each laptop, then run the script as Administrator."
         exit 0
     }
+
+} elseif (Test-Path $ExeNextToScript) {
+    # -- End-user mode: exe already here, install directly -------------------
+    # This branch only runs when the project file is NOT present.
+    # If .csproj exists we always publish and install from .\publish\ to avoid
+    # stale/incorrect binaries in the project root.
+    $ExePath = $ExeNextToScript
+    Write-Host "[1/6] Install mode: end-user (exe next to script)" -ForegroundColor Cyan
 
 } else {
     Write-Host "ERROR: Cannot find DocumentAgent.Worker.exe or .csproj next to this script." -ForegroundColor Red
@@ -194,6 +302,8 @@ Write-Host "       Service status: $finalStatus"
 
 if ($startExit -ne 0) {
     Write-Host "WARNING: Service created but failed to start (exit $startExit)." -ForegroundColor Yellow
+    Write-Host "         Service binary configuration:" -ForegroundColor Yellow
+    sc.exe qc $ServiceName | Select-String -Pattern "BINARY_PATH_NAME" | ForEach-Object { Write-Host "         $_" }
     Write-Host "         Check logs at: $env:USERPROFILE\Documents\DocumentAgent\logs"
     Write-Host "         Or Event Viewer > Windows Logs > Application"
 }
@@ -201,16 +311,27 @@ if ($startExit -ne 0) {
 # -- Summary -----------------------------------------------------------------
 $ConfigPath = "$env:USERPROFILE\Documents\DocumentAgent\agent.config.json"
 $LogPath    = "$env:USERPROFILE\Documents\DocumentAgent\logs"
+$AgentBasePath = "$env:USERPROFILE\Documents\DocumentAgent"
 
 Write-Host ""
-Write-Host "==========================================" -ForegroundColor Green
-Write-Host " DocumentAgent installed successfully" -ForegroundColor Green
-Write-Host "==========================================" -ForegroundColor Green
+if ($finalStatus -eq "Running") {
+    Write-Host "==========================================" -ForegroundColor Green
+    Write-Host " DocumentAgent installed successfully" -ForegroundColor Green
+    Write-Host "==========================================" -ForegroundColor Green
+} else {
+    Write-Host "==========================================" -ForegroundColor Yellow
+    Write-Host " DocumentAgent installed with warnings" -ForegroundColor Yellow
+    Write-Host "==========================================" -ForegroundColor Yellow
+}
 Write-Host " Exe:     $ExePath"
 Write-Host " Config:  $ConfigPath"
 Write-Host " Logs:    $LogPath"
 Write-Host " Status:  $finalStatus"
 Write-Host ""
+
+if ($startExit -ne 0 -or $finalStatus -ne "Running") {
+    Show-ServiceDiagnostics -Name $ServiceName -ExePath $ExePath -AgentBasePath $AgentBasePath
+}
 
 if (-not (Test-Path $ConfigPath)) {
     Write-Host "NEXT STEP: Create the config file at:" -ForegroundColor Yellow
