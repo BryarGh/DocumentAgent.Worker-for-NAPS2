@@ -103,6 +103,8 @@ builder.Services.AddHostedService<CleanupService>();
 
 var app = builder.Build();
 
+var trayHost = WindowsTrayHost.TryStart(app, appState, selectedPort, args);
+
 app.UseMiddleware<LoopbackAndOriginMiddleware>();
 
 app.MapGet("/health", (AppState state) => Results.Json(new
@@ -326,7 +328,14 @@ app.MapGet("/whatsapp/{messageId}", (string messageId, WhatsAppMessageQueue queu
     return Results.NotFound(new { error = "message_not_found" });
 });
 
-app.Run();
+try
+{
+    app.Run();
+}
+finally
+{
+    trayHost?.Dispose();
+}
 
 internal record ScanRequest
 {

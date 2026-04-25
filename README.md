@@ -142,8 +142,8 @@ Follow these steps on Windows machines to install and run the agent reliably, an
 
 ### Recommended runtime mode for scanner stability
 
-- You do **not** need to remove `install-service.ps1`.
-- The installer now supports **both** modes:
+- You only need `install-service.ps1` now.
+- The installer supports **both** modes:
   - default: Windows Service
   - optional: Startup Task at user logon via `-StartupTask`
 - Reason: many TWAIN/WIA drivers require an interactive desktop session and can fail in Session 0 service context.
@@ -188,6 +188,17 @@ Publish only:
 
 - Yes. It starts automatically at that user's Windows logon.
 - The installer also starts it immediately once, so you do not need to log out and back in after installation.
+- Startup task mode launches the worker in the background so a console window does not stay in front of the user.
+
+### Will it show a tray icon near the clock?
+
+- Yes.
+- In startup task mode on Windows, the agent now shows a tray icon near the clock.
+- The tray menu lets the user:
+  - open the status page
+  - open the logs folder
+  - restart the agent
+  - exit the agent
 
 ### How do I debug it later?
 
@@ -219,7 +230,13 @@ Get-ScheduledTask -TaskName "DocumentAgent-Startup"
 Get-ScheduledTaskInfo -TaskName "DocumentAgent-Startup"
 ```
 
-- If you want foreground debugging, run the EXE manually again from a normal logged-in session.
+- If you want foreground debugging with a visible console, run the EXE manually with:
+
+```powershell
+.\publish\DocumentAgent.Worker.exe --console
+```
+
+- The installer still creates a hidden launcher file next to the EXE so Windows starts it without showing a console flash.
 
 ### How do I stop or turn it off temporarily?
 

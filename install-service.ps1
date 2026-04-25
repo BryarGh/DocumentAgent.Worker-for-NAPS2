@@ -250,6 +250,24 @@ function Remove-StartupTaskInstall {
     }
 }
 
+function Ensure-HiddenLauncher {
+    param(
+        [string]$ExePath
+    )
+
+    $exeDirectory = Split-Path -Path $ExePath -Parent
+    $launcherPath = Join-Path $exeDirectory 'DocumentAgent.Worker.HiddenLauncher.vbs'
+    $escapedExePath = $ExePath.Replace('"', '""')
+
+    $launcherContent = @(
+        'Set shell = CreateObject("WScript.Shell")',
+        ('shell.Run Chr(34) & "{0}" & Chr(34), 0, False' -f $escapedExePath)
+    ) -join [Environment]::NewLine
+
+    Set-Content -Path $launcherPath -Value $launcherContent -Encoding ASCII
+    return $launcherPath
+}
+
 function Install-StartupTaskMode {
     param(
         [string]$Name,
@@ -263,7 +281,9 @@ function Install-StartupTaskMode {
     Remove-StartupTaskInstall -Name $Name
 
     Write-Host '[3/6] Creating startup task...' -ForegroundColor Cyan
-    $action = New-ScheduledTaskAction -Execute $ExePath
+    $launcherPath = Ensure-HiddenLauncher -ExePath $ExePath
+    $wscriptPath = Join-Path $env:WINDIR 'System32\wscript.exe'
+    $action = New-ScheduledTaskAction -Execute $wscriptPath -Argument ("`"{0}`"" -f $launcherPath)
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User $currentUser
     $settings = New-ScheduledTaskSettingsSet `
         -AllowStartIfOnBatteries `
@@ -281,6 +301,7 @@ function Install-StartupTaskMode {
         -Description $Description | Out-Null
 
     Write-Host "       Startup task installed for user: $currentUser" -ForegroundColor Green
+    Write-Host "       Hidden launcher: $launcherPath" -ForegroundColor Green
 
     Write-Host '[4/6] Starting startup task now...' -ForegroundColor Cyan
     Start-ScheduledTask -TaskName $Name
@@ -437,7 +458,7 @@ function Show-ModeSummary {
         Write-Host ' Remove:  .\install-service.ps1 -Uninstall'
     } else {
         Write-Host " Status:  $($InstallResult.State)"
-        Write-Host ' Start:   Runs at user logon and was started immediately by installer'
+        Write-Host ' Start:   Runs hidden at user logon and was started immediately by installer'
         Write-Host ' Stop:    Stop-Process -Name DocumentAgent.Worker -ErrorAction SilentlyContinue'
         Write-Host " Disable: Disable-ScheduledTask -TaskName $TaskName"
         Write-Host " Enable:  Enable-ScheduledTask -TaskName $TaskName"
@@ -524,6 +545,7 @@ if (Test-Path $CsprojPath) {
     Write-Host '       Publishing self-contained Windows executable...'
     dotnet publish "$CsprojPath" `
         --configuration Release `
+        --framework net8.0-windows `
         --runtime win-x64 `
         --self-contained true `
         --output "$PublishDir" `
