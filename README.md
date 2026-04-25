@@ -184,7 +184,32 @@ Reference: [PowerShell Execution Policies](https://learn.microsoft.com/en-us/pow
 
 - Common mistakes & fixes
 
-- Double PowerShell invocation error
+- **Service installs/shows as Running but port is unreachable and nothing works**
+
+  **Root cause:** Windows services run under the `LocalSystem` account. When it calls `Environment.GetFolderPath(MyDocuments)` it gets `C:\Windows\system32\config\systemprofile\Documents` — **not** your `C:\Users\<you>\Documents`. The agent starts but can't find `agent.config.json`, the log folder, the job queue, or the scan profiles, so it behaves as if it is unconfigured.
+
+  **Fix (already applied in the current install script):** `install-service.ps1` writes the real user's path into the service's registry `Environment` block right after `sc.exe create`:
+
+  ```
+  HKLM\SYSTEM\CurrentControlSet\Services\DocumentAgent  →  Environment: DOCUMENTAGENT_BASE_PATH=C:\Users\<you>\Documents\DocumentAgent
+  ```
+
+  The agent reads this variable on startup and uses it as the base path for all data.
+
+  **If you installed before this fix**, re-run the install script as Administrator (it will stop/delete the old service and reinstall with the correct environment). Or set the variable manually:
+
+  ```powershell
+  # Run as Administrator in PowerShell
+  $docs = [Environment]::GetFolderPath("MyDocuments")
+  $path = Join-Path $docs "DocumentAgent"
+  Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\DocumentAgent" `
+      -Name "Environment" -Value @("DOCUMENTAGENT_BASE_PATH=$path") -Type MultiString
+  Restart-Service DocumentAgent
+  # Verify
+  curl http://127.0.0.1:3333/health
+  ```
+
+- **Double PowerShell invocation error**
   - Error: `no : The term 'no' is not recognized ...` happens when you run `powershell powershell -NoProfile ...` inside an already opened PowerShell session. Either run the command from CMD or simply run the script directly from an elevated PowerShell prompt:
 
 ```powershell

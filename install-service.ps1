@@ -152,6 +152,23 @@ cmd /c "sc.exe failure $ServiceName reset= 86400 actions= restart/60000/restart/
 Write-Host "       Failure recovery set (exit $LASTEXITCODE)"
 
 # -- Verify service was created ----------------------------------------------
+# -- Stamp the real user's DocumentAgent path into the service environment ----
+# Windows Services run as LocalSystem whose «MyDocuments» path is
+# C:\Windows\system32\config\systemprofile\Documents — NOT the real user's folder.
+# We store the correct path in the service's registry Environment block so the
+# agent always reads/writes config, logs and scanned files from the right place.
+Write-Host "[4b/6] Setting DOCUMENTAGENT_BASE_PATH in service environment..." -ForegroundColor Cyan
+try {
+    $realDocs      = [Environment]::GetFolderPath([Environment+SpecialFolder]::MyDocuments)
+    $agentBasePath = Join-Path $realDocs "DocumentAgent"
+    $regPath       = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
+    Set-ItemProperty -Path $regPath -Name "Environment" -Value @("DOCUMENTAGENT_BASE_PATH=$agentBasePath") -Type MultiString
+    Write-Host "       DOCUMENTAGENT_BASE_PATH = $agentBasePath" -ForegroundColor Green
+} catch {
+    Write-Host "WARNING: Could not set service environment variable: $_" -ForegroundColor Yellow
+    Write-Host "         The service may use the wrong data directory.  Set DOCUMENTAGENT_BASE_PATH manually."
+}
+
 Write-Host "[5/6] Verifying service exists..." -ForegroundColor Cyan
 $created = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
 if ($null -eq $created) {

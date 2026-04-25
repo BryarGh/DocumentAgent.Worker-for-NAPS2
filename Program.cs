@@ -2785,7 +2785,18 @@ internal static class SystemInfo
 
 internal static class AgentEnvironmentPaths
 {
-    public static string GetAgentBasePath() => Path.Combine(GetDocumentsDirectory(), "DocumentAgent");
+    public static string GetAgentBasePath()
+    {
+        // When running as a Windows Service the process account (LocalSystem) has a
+        // different «Documents» folder than the real user.  The install script writes
+        // the real user's path into the service's registry Environment block so we
+        // always resolve data to the correct location.
+        var envOverride = Environment.GetEnvironmentVariable("DOCUMENTAGENT_BASE_PATH");
+        if (!string.IsNullOrWhiteSpace(envOverride) && Path.IsPathRooted(envOverride))
+            return envOverride.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+
+        return Path.Combine(GetDocumentsDirectory(), "DocumentAgent");
+    }
 
     public static string GetDiskRoot()
     {
